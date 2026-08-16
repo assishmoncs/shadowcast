@@ -1,16 +1,42 @@
 {
   "name": "shadowcast",
-  "version": "0.1.0",
-  "description": "P2P WebRTC asset delivery engine",
+  "version": "1.0.0",
+  "description": "Decentralized client-side P2P WebRTC asset delivery CDN engine",
+  "type": "module",
   "main": "dist/index.js",
+  "module": "dist/index.js",
   "types": "dist/index.d.ts",
-  "files": ["dist"],
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    },
+    "./sw": "./dist/interception/sw.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "sideEffects": false,
   "scripts": {
     "build": "tsc",
-    "dev": "tsc --watch"
+    "dev": "tsc --watch",
+    "test": "tsc && node --test dist/__tests__/*.test.js"
   },
+  "keywords": [
+    "p2p",
+    "webrtc",
+    "cdn",
+    "mesh",
+    "datachannel",
+    "asset-delivery",
+    "service-worker",
+    "indexeddb"
+  ],
+  "author": "ShadowCast Contributors",
+  "license": "MIT",
   "dependencies": {},
   "devDependencies": {
+    "@types/node": "^20.0.0",
     "typescript": "^5.5.0"
   }
 }
