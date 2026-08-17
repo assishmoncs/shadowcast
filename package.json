@@ -1,0 +1,27 @@
+{
+  "name": "shadowcast-monorepo",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Decentralized P2P WebRTC asset delivery network engine",
+  "workspaces": [
+    "library",
+    "demo"
+  ],
+  "scripts": {
+    "build": "npm --prefix library run build && npm --prefix demo run build",
+    "test": "npm --prefix library run test",
+    "dev:library": "npm --prefix library run dev",
+    "dev:demo": "npm --prefix demo run dev"
+  },
+  "keywords": [
+    "p2p",
+    "webrtc",
+    "cdn",
+    "mesh",
+    "datachannels",
+    "indexeddb",
+    "service-worker"
+  ],
+  "author": "ShadowCast Contributors",
+  "license": "MIT"
+}

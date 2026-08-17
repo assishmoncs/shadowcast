@@ -7,6 +7,21 @@ services:
       - "8080:8080"
     environment:
       - PORT=8080
+      - ALLOWED_ORIGIN=*
+      - RATE_LIMIT_PER_SEC=100
+      - MAX_ROOMS=1000
+      - MAX_CLIENTS_PER_ROOM=100
+      - READ_LIMIT_BYTES=65536
+
+  coturn:
+    image: coturn/coturn:latest
+    ports:
+      - "3478:3478/udp"
+      - "3478:3478/tcp"
+    command: >
+      -n --realm=shadowcast --fingerprint
+      --lt-cred-mech --user=shadowcast:shadowcast
+      --no-tls --no-dtls
 
   demo:
     build:
@@ -18,3 +33,4 @@ services:
       - "3000:3000"
     depends_on:
       - signaling
+      - coturn
