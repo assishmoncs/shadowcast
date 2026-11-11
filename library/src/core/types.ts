@@ -30,6 +30,11 @@ export interface PendingAsset {
   reject?: (error: Error) => void;
 }
 
+export interface AssetIntegrity {
+  sha256: string;
+  mimeType: string;
+}
+
 export interface ShadowCastConfig {
   signalingUrl?: string;
   defaultRoom?: string;
@@ -38,6 +43,9 @@ export interface ShadowCastConfig {
   p2pTimeout?: number;
   peerWaitTimeout?: number;
   verifyIntegrity?: boolean;
+  httpTimeout?: number;
+  assetIntegrity?: Readonly<Record<string, AssetIntegrity>>;
+  allowUnverifiedPeers?: boolean;
   cache?: CacheConfig;
 }
 
@@ -59,6 +67,8 @@ export interface SwarmBitfieldMessage {
   assetId: string;
   url: string;
   totalChunks: number;
+  sizeBytes?: number;
+  chunkSize?: number;
   availableChunks: number[];
   assetHash: string;
   mimeType: string;
@@ -84,7 +94,9 @@ export interface ShadowCastStats {
   transfersCount: number;
 }
 
-export const DEFAULT_CHUNK_SIZE = 64 * 1024; // 64 KB
+export const DEFAULT_CHUNK_SIZE = 64 * 1024;
+export const MAX_SWARM_CHUNKS = 4096;
+export const MAX_SWARM_ASSET_BYTES = 64 * 1024 * 1024;
 export const DEFAULT_ROOM = 'shadowcast-global';
 export const DEFAULT_SIGNALING_URL = 'ws://localhost:8080/ws';
 export const DEFAULT_ICE_SERVERS: RTCIceServer[] = [

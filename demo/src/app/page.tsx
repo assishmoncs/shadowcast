@@ -15,6 +15,7 @@ interface TransferLogEntry {
 }
 
 const ASSET_PRESETS = [
+  { name: 'Local Sample', url: '/sample.png' },
   {
     name: 'Nebula Space',
     url: 'https://images.unsplash.com/photo-1451187580459-43490279c0fa?q=80&w=2072&auto=format&fit=crop',
@@ -51,6 +52,7 @@ export default function ShadowCastDemo() {
   const [cacheHits, setCacheHits] = useState(0);
   const [totalTransfers, setTotalTransfers] = useState(0);
   const [isSwRegistered, setIsSwRegistered] = useState(false);
+  const [isSwUpdating, setIsSwUpdating] = useState(false);
 
   const [selectedUrl, setSelectedUrl] = useState(ASSET_PRESETS[0].url);
   const [assetUrl, setAssetUrl] = useState('');
@@ -70,6 +72,13 @@ export default function ShadowCastDemo() {
     const signalingUrl = process.env.NEXT_PUBLIC_SIGNALING_URL || 'ws://localhost:8080/ws';
     const sc = new ShadowCast({
       signalingUrl,
+      allowUnverifiedPeers: true,
+      assetIntegrity: {
+        '/sample.png': {
+          sha256: '38dbed0683648abcc8776b26cffac2ac04d94f63c0e9aba9b3aae4fb94df42b5',
+          mimeType: 'image/png',
+        },
+      },
       cache: {
         driver: 'indexeddb',
         maxSizeBytes: 250 * 1024 * 1024,
@@ -125,23 +134,23 @@ export default function ShadowCastDemo() {
     const unsubHit = sc.on('cache:hit', unsubCacheHit);
 
     // Connect to room gracefully (falls back to HTTP/Cache if signaling is unreachable)
-    sc.connect('shadowcast-global').catch(() => {
-      setConnectionStatus('disconnected');
-    });
+    void sc.connect('shadowcast-global').catch(() => {});
 
     // Check if SW is already registered
     if (typeof window !== 'undefined' && 'serviceWorker' in navigator) {
       navigator.serviceWorker
         .getRegistration()
-        .then((reg) => {
-          setIsSwRegistered(!!reg);
+        .then(async (reg) => {
+          if (scRef.current === sc && reg) {
+            const registration = await sc.registerServiceWorker('/shadowcast-sw.js');
+            if (scRef.current === sc) setIsSwRegistered(Boolean(registration));
+          }
         })
-        .catch(() => {
-          setIsSwRegistered(false);
-        });
+        .catch(() => {});
     }
 
     return () => {
+      if (scRef.current === sc) scRef.current = null;
       unsubStatus();
       unsubPeerJoin();
       unsubPeerLeave();
@@ -153,19 +162,30 @@ export default function ShadowCastDemo() {
     };
   }, []);
 
-  const handleToggleServiceWorker = async () => {
-    if (!scRef.current) return;
+  useEffect(() => {
+    const sc = scRef.current;
+    return () => { if (assetUrl) sc?.releaseAsset(assetUrl); };
+  }, [assetUrl]);
 
-    if (isSwRegistered) {
-      const success = await scRef.current.unregisterServiceWorker();
-      if (success) {
-        setIsSwRegistered(false);
+  useEffect(() => {
+    const sc = scRef.current;
+    return () => { for (const url of galleryUrls) sc?.releaseAsset(url); };
+  }, [galleryUrls]);
+
+  const handleToggleServiceWorker = async () => {
+    const sc = scRef.current;
+    if (!sc) return;
+    setIsSwUpdating(true);
+    try {
+      if (isSwRegistered) {
+        if (await sc.unregisterServiceWorker()) setIsSwRegistered(false);
+        else setError('Could not unregister the service worker');
+      } else {
+        if (await sc.registerServiceWorker('/shadowcast-sw.js')) setIsSwRegistered(true);
+        else setError('Could not register the service worker');
       }
-    } else {
-      const reg = await scRef.current.registerServiceWorker('/sw.js');
-      if (reg) {
-        setIsSwRegistered(true);
-      }
+    } finally {
+      setIsSwUpdating(false);
     }
   };
 
@@ -186,6 +206,7 @@ export default function ShadowCastDemo() {
     setProgressPercent(0);
     setCurrentSource(null);
     setLastDurationMs(null);
+    setAssetUrl('');
     setGalleryUrls([]);
 
     try {
@@ -207,11 +228,14 @@ export default function ShadowCastDemo() {
     setProgressPercent(0);
     setCurrentSource(null);
     setAssetUrl('');
+    setGalleryUrls([]);
 
     try {
-      const promises = GALLERY_PRESETS.map((url) => scRef.current!.requestAsset(url));
-      const urls = await Promise.all(promises);
+      const sc = scRef.current;
+      const results = await Promise.allSettled(GALLERY_PRESETS.map((url) => sc.requestAsset(url)));
+      const urls = results.flatMap((result) => result.status === 'fulfilled' ? [result.value] : []);
       setGalleryUrls(urls);
+      if (urls.length < results.length) setError('Some gallery images could not be loaded');
     } catch (err: any) {
       console.error(err);
       setError(err.message || 'Failed to transfer swarm gallery');
@@ -340,6 +364,7 @@ export default function ShadowCastDemo() {
               </button>
               <button
                 onClick={handleToggleServiceWorker}
+                disabled={isSwUpdating}
                 style={{
                   background: isSwRegistered ? 'rgba(0, 255, 159, 0.15)' : 'rgba(255, 255, 255, 0.08)',
                   border: `1px solid ${isSwRegistered ? 'rgba(0, 255, 159, 0.35)' : 'var(--panel-border)'}`,
@@ -374,6 +399,7 @@ export default function ShadowCastDemo() {
               <input
                 type="text"
                 className="url-input"
+                aria-label="Asset URL"
                 value={selectedUrl}
                 onChange={(e) => setSelectedUrl(e.target.value)}
                 placeholder="https://..."

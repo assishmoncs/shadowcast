@@ -51,7 +51,7 @@ func readJSONMsg(t *testing.T, conn *websocket.Conn) map[string]interface{} {
 }
 
 func TestHealthAndMetricsEndpoints(t *testing.T) {
-	handler := initServerState(newTestConfig())
+	handler := newSignalingServer(newTestConfig())
 	ts := httptest.NewServer(handler)
 	defer ts.Close()
 
@@ -87,7 +87,7 @@ func TestHealthAndMetricsEndpoints(t *testing.T) {
 }
 
 func TestWebSocketJoinAndSignalingRelay(t *testing.T) {
-	handler := initServerState(newTestConfig())
+	handler := newSignalingServer(newTestConfig())
 	ts := httptest.NewServer(handler)
 	defer ts.Close()
 
@@ -158,5 +158,163 @@ func TestRateLimiter(t *testing.T) {
 	}
 	if rl.Allow() {
 		t.Fatalf("expected 3rd immediate request to be rate-limited")
+	}
+}
+
+func writeJSONMsg(t *testing.T, conn *websocket.Conn, message map[string]any) {
+	t.Helper()
+	if err := conn.WriteJSON(message); err != nil {
+		t.Fatalf("write websocket message: %v", err)
+	}
+}
+
+func joinAs(t *testing.T, conn *websocket.Conn, room, peer string) map[string]any {
+	t.Helper()
+	writeJSONMsg(t, conn, map[string]any{"type": "join", "room": room, "from": peer})
+	return readJSONMsg(t, conn)
+}
+
+func startTestServer(t *testing.T, config *Config) (*SignalingServer, *httptest.Server) {
+	t.Helper()
+	server := newSignalingServer(config)
+	httpServer := httptest.NewServer(server)
+	t.Cleanup(func() {
+		server.close()
+		httpServer.Close()
+	})
+	return server, httpServer
+}
+
+func connectTestPeer(t *testing.T, url string) *websocket.Conn {
+	t.Helper()
+	conn := dialWS(t, url, nil)
+	t.Cleanup(func() { _ = conn.Close() })
+	if msg := readJSONMsg(t, conn); msg["type"] != "self-id" {
+		t.Fatalf("unexpected initial message: %v", msg)
+	}
+	return conn
+}
+
+func TestRoomRelayIsolationAndIdentity(t *testing.T) {
+	t.Parallel()
+	_, server := startTestServer(t, newTestConfig())
+	alpha := connectTestPeer(t, server.URL)
+	beta := connectTestPeer(t, server.URL)
+	offer := map[string]any{
+		"type": "offer", "from": "forged", "target": "beta",
+		"sdp": map[string]string{"type": "offer", "sdp": "v=0"},
+	}
+	writeJSONMsg(t, alpha, offer)
+	if msg := readJSONMsg(t, alpha); msg["type"] != "error" {
+		t.Fatalf("expected unjoined relay rejection: %v", msg)
+	}
+	if msg := joinAs(t, alpha, "first", "alpha"); msg["id"] != "alpha" || msg["room"] != "first" {
+		t.Fatalf("invalid join acknowledgment: %v", msg)
+	}
+	if msg := joinAs(t, beta, "second", "alpha"); msg["type"] != "error" {
+		t.Fatalf("expected duplicate ID rejection: %v", msg)
+	}
+	if msg := joinAs(t, beta, "second", "beta"); msg["type"] != "room-peers" {
+		t.Fatalf("failed to join second room: %v", msg)
+	}
+
+	writeJSONMsg(t, alpha, offer)
+	if msg := readJSONMsg(t, alpha); msg["type"] != "error" {
+		t.Fatalf("expected cross-room rejection: %v", msg)
+	}
+	if msg := joinAs(t, beta, "first", "beta"); msg["type"] != "room-peers" {
+		t.Fatalf("expected clean acknowledgment after blocked relay: %v", msg)
+	}
+	if msg := readJSONMsg(t, alpha); msg["type"] != "peer-joined" || msg["id"] != "beta" {
+		t.Fatalf("expected join notification: %v", msg)
+	}
+
+	if msg := joinAs(t, alpha, "first", "renamed"); msg["type"] != "error" {
+		t.Fatalf("expected immutable peer ID: %v", msg)
+	}
+	writeJSONMsg(t, alpha, offer)
+	if msg := readJSONMsg(t, beta); msg["type"] != "offer" || msg["from"] != "alpha" {
+		t.Fatalf("expected authenticated sender identity: %v", msg)
+	}
+
+	if msg := joinAs(t, beta, "third", "beta"); msg["room"] != "third" {
+		t.Fatalf("failed to switch rooms: %v", msg)
+	}
+	if msg := readJSONMsg(t, alpha); msg["type"] != "peer-left" || msg["id"] != "beta" {
+		t.Fatalf("expected leave notification: %v", msg)
+	}
+}
+
+func TestConcurrentJoinsHonorCapacity(t *testing.T) {
+	t.Parallel()
+	config := newTestConfig()
+	config.MaxRooms = 1
+	config.MaxClientsPerRoom = 1
+	_, server := startTestServer(t, config)
+	clients := []*websocket.Conn{connectTestPeer(t, server.URL), connectTestPeer(t, server.URL)}
+	for _, conn := range clients {
+		writeJSONMsg(t, conn, map[string]any{"type": "join", "room": "limited"})
+	}
+	first := readJSONMsg(t, clients[0])
+	second := readJSONMsg(t, clients[1])
+	if first["type"] == second["type"] {
+		t.Fatalf("expected exactly one successful join: %v %v", first, second)
+	}
+	winner, loser := clients[0], clients[1]
+	if first["type"] == "error" {
+		winner, loser = loser, winner
+	}
+	if msg := joinAs(t, loser, "other", ""); msg["type"] != "error" {
+		t.Fatalf("expected room capacity rejection: %v", msg)
+	}
+	if msg := joinAs(t, winner, "other", ""); msg["room"] != "other" {
+		t.Fatalf("the sole member should be able to move at the room limit: %v", msg)
+	}
+}
+
+func TestAuthenticationOriginAndShutdown(t *testing.T) {
+	t.Parallel()
+	config := newTestConfig()
+	config.AuthToken = "test-secret"
+	config.AllowedOrigins = []string{"https://assets.example"}
+	handler, server := startTestServer(t, config)
+	url := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws"
+
+	for _, tc := range []struct {
+		name, token, origin string
+		status              int
+	}{
+		{"missing token", "", "https://assets.example", http.StatusUnauthorized},
+		{"untrusted origin", "test-secret", "https://other.example", http.StatusForbidden},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			conn, resp, err := websocket.DefaultDialer.Dial(url, http.Header{
+				"Origin": {tc.origin}, "X-Auth-Token": {tc.token},
+			})
+			if conn != nil {
+				_ = conn.Close()
+			}
+			if resp != nil {
+				defer resp.Body.Close()
+			}
+			if err == nil || resp == nil || resp.StatusCode != tc.status {
+				t.Fatalf("expected upgrade status %d, got %v, %v", tc.status, resp, err)
+			}
+		})
+	}
+	conn := dialWS(t, server.URL, http.Header{
+		"Origin": {"https://assets.example"}, "X-Auth-Token": {"test-secret"},
+	})
+	defer conn.Close()
+	readJSONMsg(t, conn)
+	handler.close()
+	_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+	if _, _, err := conn.ReadMessage(); err == nil {
+		t.Fatal("shutdown should close the active WebSocket")
+	}
+	ready := httptest.NewRecorder()
+	handler.ServeHTTP(ready, httptest.NewRequest(http.MethodGet, "/ready", nil))
+	if ready.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected draining readiness status, got %d", ready.Code)
 	}
 }

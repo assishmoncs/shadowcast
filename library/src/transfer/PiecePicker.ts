@@ -75,9 +75,9 @@ export class PiecePicker {
 
     this.assetTotalChunks.set(assetId, totalChunks);
     const peerMap = this.swarmAvailability.get(assetId);
-    const validPeers = availablePeers.filter((pid) => !peerMap || peerMap.has(pid));
+    const validPeers = new Set(availablePeers.filter((pid) => !peerMap || peerMap.has(pid)));
 
-    if (validPeers.length === 0) {
+    if (validPeers.size === 0) {
       return [];
     }
 
@@ -99,9 +99,11 @@ export class PiecePicker {
       // If unassigned, assigned to a disconnected peer, or timed out, schedule it
       if (
         !current ||
-        !validPeers.includes(current.peerId) ||
+        !validPeers.has(current.peerId) ||
+        (peerMap && !peerMap.get(current.peerId)?.has(i)) ||
         now - current.assignedAt > this.assignmentTimeoutMs
       ) {
+        assignmentsMap.delete(i);
         neededChunks.push(i);
       }
     }
@@ -127,26 +129,18 @@ export class PiecePicker {
     for (let i = 0; i < neededChunks.length; i++) {
       const chunkIdx = neededChunks[i];
 
-      // Filter to peers that actually possess this chunk index
-      const capablePeers = peerMap
-        ? validPeers.filter((pid) => peerMap.get(pid)?.has(chunkIdx))
-        : validPeers;
-
-      if (capablePeers.length === 0) {
-        continue;
-      }
-
       // Select capable peer with minimum assigned load
-      let chosenPeer = capablePeers[0];
-      let minLoad = peerLoad.get(chosenPeer) ?? 0;
-      for (let j = 1; j < capablePeers.length; j++) {
-        const candidate = capablePeers[j];
-        const load = peerLoad.get(candidate) ?? 0;
+      let chosenPeer: string | undefined;
+      let minLoad = Infinity;
+      for (const candidate of validPeers) {
+        if (peerMap && !peerMap.get(candidate)?.has(chunkIdx)) continue;
+        const load = peerLoad.get(candidate)!;
         if (load < minLoad) {
           minLoad = load;
           chosenPeer = candidate;
         }
       }
+      if (chosenPeer === undefined) continue;
 
       result.get(chosenPeer)!.push(chunkIdx);
       peerLoad.set(chosenPeer, minLoad + 1);

@@ -11,6 +11,7 @@ type Config struct {
 	Port              string
 	AllowedOrigins    []string
 	MaxRooms          int
+	MaxConnections    int
 	MaxClientsPerRoom int
 	RateLimitPerSec   int
 	AuthToken         string
@@ -49,6 +50,7 @@ func LoadConfig() *Config {
 		Port:              port,
 		AllowedOrigins:    allowedOrigins,
 		MaxRooms:          maxRooms,
+		MaxConnections:    getEnvInt("MAX_CONNECTIONS", 1000),
 		MaxClientsPerRoom: maxClientsPerRoom,
 		RateLimitPerSec:   rateLimit,
 		AuthToken:         authToken,
@@ -64,7 +66,7 @@ func getEnvInt(key string, defaultVal int) int {
 		return defaultVal
 	}
 	val, err := strconv.Atoi(valStr)
-	if err != nil {
+	if err != nil || val <= 0 {
 		return defaultVal
 	}
 	return val

@@ -135,9 +135,18 @@ export async function hashBuffer(buffer: ArrayBuffer | ArrayBufferView): Promise
 /**
  * Computes SHA-256 hash of a Blob as a 64-character lowercase hex string.
  */
-export async function hashBlob(blob: Blob): Promise<string> {
-  const buffer = await blob.arrayBuffer();
-  return hashBuffer(buffer);
+const blobDigests = new WeakMap<Blob, Promise<string>>();
+
+export function hashBlob(blob: Blob): Promise<string> {
+  let digest = blobDigests.get(blob);
+  if (!digest) {
+    digest = blob.arrayBuffer().then(hashBuffer).catch((error) => {
+      blobDigests.delete(blob);
+      throw error;
+    });
+    blobDigests.set(blob, digest);
+  }
+  return digest;
 }
 
 /**

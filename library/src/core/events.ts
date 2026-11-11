@@ -51,7 +51,7 @@ export class EventEmitter<Events = ShadowCastEventMap> {
     }
     const onceWrapper: WrappedListener<Events[K]> = (data) => {
       this.off(event, onceWrapper);
-      listener(data);
+      return listener(data);
     };
     onceWrapper.__originalListener = listener;
     return this.on(event, onceWrapper);
@@ -76,11 +76,15 @@ export class EventEmitter<Events = ShadowCastEventMap> {
     const set = this.listeners.get(event);
     if (!set || set.size === 0) return;
 
+    const report = (error: unknown) => {
+      console.error(`[ShadowCast EventEmitter] Error in listener for "${String(event)}":`, error);
+    };
     for (const listener of Array.from(set)) {
       try {
-        listener(data);
+        const result = listener(data) as PromiseLike<void> | undefined;
+        if (typeof result?.then === 'function') void Promise.resolve(result).catch(report);
       } catch (err) {
-        console.error(`[ShadowCast EventEmitter] Error in listener for "${String(event)}":`, err);
+        report(err);
       }
     }
   }

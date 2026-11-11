@@ -14,6 +14,7 @@ export class PeerConnection {
   public pc: RTCPeerConnection;
   public dc: RTCDataChannel | null = null;
   private pendingIceCandidates: RTCIceCandidateInit[] = [];
+  private readonly writableWaiters = new Set<(writable: boolean) => void>();
   private closed = false;
 
   constructor(
@@ -34,7 +35,7 @@ export class PeerConnection {
 
     this.pc.onconnectionstatechange = () => {
       if (this.closed) return;
-      if (['failed', 'disconnected', 'closed'].includes(this.pc.connectionState)) {
+      if (['failed', 'closed'].includes(this.pc.connectionState)) {
         this.callbacks.onDisconnect();
       }
     };
@@ -64,6 +65,8 @@ export class PeerConnection {
   private setupDataChannel(channel: RTCDataChannel): void {
     this.dc = channel;
     this.dc.binaryType = 'arraybuffer';
+    channel.bufferedAmountLowThreshold = 512 * 1024;
+    channel.onbufferedamountlow = () => this.notifyWritable(true);
 
     this.dc.onopen = () => {
       if (!this.closed) {
@@ -117,7 +120,7 @@ export class PeerConnection {
 
     // Queue ICE candidates that arrive before remoteDescription is set
     if (!this.pc.remoteDescription) {
-      this.pendingIceCandidates.push(candidate);
+      if (this.pendingIceCandidates.length < 128) this.pendingIceCandidates.push(candidate);
       return;
     }
 
@@ -142,14 +145,36 @@ export class PeerConnection {
   send(data: string | ArrayBuffer): boolean {
     if (!this.closed && this.dc && this.dc.readyState === 'open') {
       try {
-        this.dc.send(data as any);
+        if (typeof data === 'string') this.dc.send(data);
+        else this.dc.send(data);
         return true;
       } catch (err) {
         console.warn(`[ShadowCast] Failed to send over DataChannel to ${this.peerId}:`, err);
+        this.callbacks.onDisconnect();
         return false;
       }
     }
     return false;
+  }
+
+  async waitForWritable(bytes: number): Promise<boolean> {
+    if (!this.isDataChannelOpen) return false;
+    const maximum = this.pc.sctp?.maxMessageSize;
+    if (maximum && bytes > maximum) return false;
+    if (!(this.dc!.bufferedAmount > this.dc!.bufferedAmountLowThreshold)) return true;
+    return new Promise<boolean>((resolve) => {
+      const done = (writable: boolean) => {
+        clearTimeout(timer);
+        this.writableWaiters.delete(done);
+        resolve(writable);
+      };
+      const timer = setTimeout(() => done(false), 5000);
+      this.writableWaiters.add(done);
+    });
+  }
+
+  private notifyWritable(writable: boolean): void {
+    for (const waiter of this.writableWaiters) waiter(writable);
   }
 
   get isDataChannelOpen(): boolean {
@@ -158,6 +183,7 @@ export class PeerConnection {
 
   close(): void {
     this.closed = true;
+    this.notifyWritable(false);
     this.pendingIceCandidates = [];
 
     if (this.dc) {
@@ -167,6 +193,7 @@ export class PeerConnection {
       channel.onmessage = null;
       channel.onclose = null;
       channel.onerror = null;
+      channel.onbufferedamountlow = null;
       try {
         if (channel.readyState !== 'closed') {
           channel.close();

@@ -19,16 +19,16 @@ export class LRUPolicy {
     maxEntries: number = DEFAULT_MAX_ENTRIES,
     ttlMs: number = DEFAULT_CACHE_TTL
   ) {
-    this.maxSizeBytes = Math.max(0, maxSizeBytes);
-    this.maxEntries = Math.max(0, maxEntries);
-    this.ttlMs = Math.max(0, ttlMs);
+    this.maxSizeBytes = Number.isNaN(maxSizeBytes) ? DEFAULT_MAX_CACHE_SIZE : Math.max(0, Math.floor(maxSizeBytes));
+    this.maxEntries = Number.isNaN(maxEntries) ? DEFAULT_MAX_ENTRIES : Math.max(0, Math.floor(maxEntries));
+    this.ttlMs = Number.isNaN(ttlMs) ? DEFAULT_CACHE_TTL : Math.max(0, ttlMs);
   }
 
   /**
    * Checks whether a single entry has expired according to the configured TTL.
    */
-  isExpired(entry: Pick<CacheEntryMetadata, 'storedAt'>, now: number = Date.now()): boolean {
-    return this.ttlMs > 0 && now - entry.storedAt > this.ttlMs;
+  isExpired(entry: Pick<CacheEntryMetadata, 'storedAt' | 'expiresAt'>, now: number = Date.now()): boolean {
+    return now >= (entry.expiresAt ?? Infinity) || (this.ttlMs > 0 && now - entry.storedAt >= this.ttlMs);
   }
 
   /**

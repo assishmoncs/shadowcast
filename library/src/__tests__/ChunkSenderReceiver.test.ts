@@ -119,5 +119,5 @@ test('ChunkReceiver detects corrupted chunk SHA-256 and recovers when valid chun
   }
 
   assert.ok(completedBlob !== undefined, 'Should complete after receiving valid chunks');
-  assert.equal(await completedBlob!.text(), 'ABCDEFGHIJKLMNOP');
+  assert.equal(await (completedBlob as Blob).text(), 'ABCDEFGHIJKLMNOP');
 });

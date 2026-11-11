@@ -24,6 +24,7 @@ export default function PlaygroundPage() {
     const signalingUrl = process.env.NEXT_PUBLIC_SIGNALING_URL || 'ws://localhost:8080/ws';
     const sc = new ShadowCast({
       signalingUrl,
+      allowUnverifiedPeers: true,
       cache: { driver: 'indexeddb' },
     });
     scRef.current = sc;
@@ -58,6 +59,7 @@ export default function PlaygroundPage() {
 
     return () => {
       clearInterval(interval);
+      if (scRef.current === sc) scRef.current = null;
       sc.destroy();
     };
   }, []);
@@ -77,12 +79,14 @@ export default function PlaygroundPage() {
   };
 
   const handleRequestAsset = async () => {
-    if (!scRef.current || !inputUrl) return;
+    const sc = scRef.current;
+    if (!sc || !inputUrl) return;
     setIsRunning(true);
     try {
       addLog(`Executing: await sc.requestAsset("${inputUrl.slice(0, 40)}...")`);
-      const objectUrl = await scRef.current.requestAsset(inputUrl);
+      const objectUrl = await sc.requestAsset(inputUrl);
       addLog(`Resolved ObjectURL: ${objectUrl.slice(0, 35)}...`);
+      sc.releaseAsset(objectUrl);
     } catch (err: any) {
       addLog(`Error in requestAsset: ${err.message}`);
     } finally {

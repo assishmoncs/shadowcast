@@ -15,6 +15,7 @@ export type {
   CacheEntry,
   CacheEntryMetadata,
   CacheStore,
+  CacheWriteOptions,
 } from './cache/types.js';
 export {
   DEFAULT_MAX_CACHE_SIZE,
@@ -43,6 +44,7 @@ export type {
   ChunkBuffer,
   PendingAsset,
   ShadowCastConfig,
+  AssetIntegrity,
   ShadowCastStats,
   SignalingMessagePayload,
   SwarmBitfieldMessage,

@@ -3,98 +3,66 @@ import assert from 'node:assert/strict';
 import { ServiceWorkerManager } from '../interception/ServiceWorkerManager.js';
 import { DEFAULT_SW_INCLUDE_PATTERNS } from '../interception/types.js';
 
-test('DEFAULT_SW_INCLUDE_PATTERNS matches static assets with and without query strings', () => {
-  const urls = [
-    'https://example.com/photo.jpg',
-    'https://images.unsplash.com/photo.png?q=80&w=1080',
-    'https://cdn.example.com/bundle.wasm?v=2.1.0',
-    'https://cdn.example.com/font.woff2',
-  ];
-
-  for (const url of urls) {
-    const matched = DEFAULT_SW_INCLUDE_PATTERNS.some((p) => p.test(url));
-    assert.equal(matched, true, `Should match ${url}`);
-  }
-
-  const nonStatic = 'https://example.com/api/v1/users.json';
-  assert.equal(
-    DEFAULT_SW_INCLUDE_PATTERNS.some((p) => p.test(nonStatic)),
-    false
-  );
+test('Default service worker patterns match static assets with query strings', () => {
+  const matches = (url: string) => DEFAULT_SW_INCLUDE_PATTERNS.some((pattern) => pattern.test(url));
+  assert.equal(matches('https://example.com/photo.jpg'), true);
+  assert.equal(matches('https://cdn.example.com/bundle.wasm?v=2'), true);
+  assert.equal(matches('https://example.com/api/users.json'), false);
 });
 
-test('ServiceWorkerManager registers worker, posts config, and serves SHADOWCAST_SW_REQUEST over MessageChannel', async () => {
-  let registeredListener: ((ev: any) => void) | null = null;
-  let postedConfig: any = null;
-  let unregistered = false;
-
-  (globalThis as any).window = globalThis;
+test('ServiceWorkerManager preserves regex flags and accepts requests only from its worker', async (t) => {
+  const listeners = new Map<string, (event: unknown) => Promise<void> | void>();
+  const posts: unknown[] = [];
+  const worker = { postMessage: (message: unknown) => posts.push(message) };
+  const registration = { active: worker, unregister: t.mock.fn(async () => true) };
+  const register = t.mock.fn(async () => registration);
+  const original = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
   Object.defineProperty(globalThis, 'navigator', {
     configurable: true,
     value: {
       serviceWorker: {
-        register: async () => ({
-          active: {
-            postMessage: (msg: any) => {
-              postedConfig = msg;
-            },
-          },
-          unregister: async () => {
-            unregistered = true;
-            return true;
-          },
-        }),
-        addEventListener: (_type: string, fn: any) => {
-          registeredListener = fn;
-        },
-        removeEventListener: () => {
-          registeredListener = null;
-        },
+        register,
+        addEventListener: (type: string, listener: (event: unknown) => void) => listeners.set(type, listener),
+        removeEventListener: (type: string) => listeners.delete(type),
       },
     },
   });
-
-  const swManager = new ServiceWorkerManager({
-    onRequestAssetBlob: async (url) =>
-      new Blob([new TextEncoder().encode(`content:${url}`)], { type: 'image/webp' }),
+  t.after(() => {
+    if (original) Object.defineProperty(globalThis, 'navigator', original);
+    else Reflect.deleteProperty(globalThis, 'navigator');
   });
 
-  const reg = await swManager.register('/sw.js', {
+  const asset = 'https://example.com/hero.webp';
+  const manager = new ServiceWorkerManager({
+    onRequestAssetBlob: async (url) => new Blob([url], { type: 'image/webp' }),
+    assetUrls: [asset],
+  });
+  assert.ok(await manager.register('/sw.js', {
     scope: '/app',
     timeoutMs: 4000,
-    includePatterns: [/\.webp$/i],
+    includePatterns: [/\.webp$/gi, /\.PNG$/u],
+  }));
+  assert.deepEqual(register.mock.calls[0].arguments, ['/sw.js', { scope: '/app', type: 'module' }]);
+  assert.deepEqual(posts[0], {
+    type: 'SHADOWCAST_SW_CONFIG',
+    assetUrls: [asset],
+    includePatterns: [{ source: '\\.webp$', flags: 'i' }, { source: '\\.PNG$', flags: 'u' }],
+    excludePatterns: undefined,
+    timeoutMs: 4000,
   });
 
-  assert.ok(reg !== null);
-  assert.equal(postedConfig?.type, 'SHADOWCAST_SW_CONFIG');
-  assert.equal(postedConfig?.timeoutMs, 4000);
-  assert.ok(registeredListener !== null);
-
-  // Simulate Service Worker requesting an asset via MessagePort
-  let portReply: any = null;
-  const mockPort = {
-    postMessage: (msg: any) => {
-      portReply = msg;
-    },
-    close: () => {},
-  };
-
-  await registeredListener!({
-    data: {
-      type: 'SHADOWCAST_SW_REQUEST',
-      id: 'req-42',
-      url: 'https://example.com/hero.webp',
-    },
-    ports: [mockPort],
-  });
-
-  assert.ok(portReply !== null);
-  assert.equal(portReply.success, true);
-  assert.equal(portReply.id, 'req-42');
-  assert.equal(portReply.mimeType, 'image/webp');
-  assert.equal(await portReply.blob.text(), 'content:https://example.com/hero.webp');
-
-  const unregResult = await swManager.unregister();
-  assert.equal(unregResult, true);
-  assert.equal(unregistered, true);
+  const replies: { id: string; success: boolean; blob: Blob }[] = [];
+  const port = { postMessage: (message: typeof replies[number]) => replies.push(message), close: t.mock.fn() };
+  const data = { type: 'SHADOWCAST_SW_REQUEST', id: 'request', url: asset };
+  const onMessage = listeners.get('message')!;
+  await onMessage({ source: {}, data, ports: [port] });
+  assert.equal(replies.length, 0);
+  await onMessage({ source: worker, data, ports: [port] });
+  assert.equal(replies[0].id, 'request');
+  assert.equal(replies[0].success, true);
+  assert.equal(await replies[0].blob.text(), asset);
+  assert.equal(port.close.mock.callCount(), 1);
+  assert.equal(await manager.unregister(), true);
+  assert.equal(registration.unregister.mock.callCount(), 1);
+  assert.equal(listeners.size, 0);
 });

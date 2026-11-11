@@ -16,7 +16,7 @@ type RateLimiter struct {
 func NewRateLimiter(ratePerSec int) *RateLimiter {
 	return &RateLimiter{
 		rate:       float64(ratePerSec),
-		capacity:   float64(ratePerSec * 2), // Allow short bursts
+		capacity:   float64(ratePerSec) * 2, // Allow short bursts
 		tokens:     float64(ratePerSec),
 		lastRefill: time.Now(),
 	}

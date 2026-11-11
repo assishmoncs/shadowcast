@@ -1,0 +1,11 @@
+.git
+**/node_modules
+**/.next
+**/dist
+**/.test-dist
+**/*.tsbuildinfo
+**/.env
+**/.env.*
+demo/public/shadowcast-sw.js
+test-results
+playwright-report

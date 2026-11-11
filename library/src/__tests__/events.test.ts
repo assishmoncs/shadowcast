@@ -62,3 +62,18 @@ test('EventEmitter off removes listener', () => {
   ee.emit('status', { state: 'connected' });
   assert.equal(count, 1);
 });
+
+test('Async event listener rejections are isolated from other subscribers', async (t) => {
+  const emitter = new EventEmitter<{ sample: string }>();
+  const error = new Error('listener failed');
+  const report = t.mock.method(console, 'error', () => {});
+  const other = t.mock.fn();
+  emitter.once('sample', async () => { throw error; });
+  emitter.on('sample', other);
+  emitter.emit('sample', 'one');
+  emitter.emit('sample', 'two');
+  await new Promise<void>((resolve) => queueMicrotask(resolve));
+  assert.equal(other.mock.callCount(), 2);
+  assert.equal(report.mock.callCount(), 1);
+  assert.equal(report.mock.calls[0].arguments[1], error);
+});

@@ -24,10 +24,16 @@ export interface SWAssetResponseMessage {
   error?: string;
 }
 
+export interface SWPattern {
+  source: string;
+  flags: string;
+}
+
 export interface SWConfigMessage {
   type: 'SHADOWCAST_SW_CONFIG';
-  includePatterns?: string[];
-  excludePatterns?: string[];
+  assetUrls?: readonly string[];
+  includePatterns?: (string | SWPattern)[];
+  excludePatterns?: (string | SWPattern)[];
   timeoutMs?: number;
 }
 

@@ -28,9 +28,11 @@ export default function PeerGraph({ peersCount, activeSource, isStreaming }: Pee
 
       // Handle Retina display pixel ratio
       const dpr = window.devicePixelRatio || 1;
-      if (canvas.width !== width * dpr || canvas.height !== height * dpr) {
-        canvas.width = width * dpr;
-        canvas.height = height * dpr;
+      const pixelWidth = Math.round(width * dpr);
+      const pixelHeight = Math.round(height * dpr);
+      if (canvas.width !== pixelWidth || canvas.height !== pixelHeight) {
+        canvas.width = pixelWidth;
+        canvas.height = pixelHeight;
       }
 
       ctx.save();
@@ -71,7 +73,6 @@ export default function PeerGraph({ peersCount, activeSource, isStreaming }: Pee
       ctx.textAlign = 'center';
       ctx.fillText('Origin', originX, originY + 24);
 
-      // Determine display peer count (show at least 1 ghost peer if 0 to show topology)
       const displayPeers = Math.max(peersCount, 0);
 
       // Draw remote peer nodes around the center
@@ -141,12 +142,17 @@ export default function PeerGraph({ peersCount, activeSource, isStreaming }: Pee
       ctx.restore();
 
       particleOffset = (particleOffset + 0.015) % 1;
-      animationFrameId = requestAnimationFrame(render);
+      if (activeSource === 'p2p' && isStreaming) animationFrameId = requestAnimationFrame(render);
     };
 
-    render();
+    const observer = new ResizeObserver(() => {
+      cancelAnimationFrame(animationFrameId);
+      render();
+    });
+    observer.observe(canvas);
 
     return () => {
+      observer.disconnect();
       cancelAnimationFrame(animationFrameId);
     };
   }, [peersCount, activeSource, isStreaming]);

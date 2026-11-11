@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { ShadowCast } from '../core/ShadowCast.js';
+import { hashBlob } from '../utils/hash.js';
 
 /**
  * In-memory virtual WebSocket + WebRTC DataChannel network bus
@@ -58,7 +59,7 @@ class VirtualNetworkEnvironment {
 
           queueMicrotask(() => {
             this.onmessage?.({
-              data: JSON.stringify({ type: 'room-peers', peers: existing }),
+              data: JSON.stringify({ type: 'room-peers', room: msg.room, id: msg.from, peers: existing }),
             });
             for (const otherId of existing) {
               env.socketsByPeer.get(otherId)?.onmessage?.({
@@ -217,6 +218,7 @@ class VirtualNetworkEnvironment {
       return {
         ok: true,
         status: 200,
+        headers: new Headers(),
         blob: async () => blob,
       };
     };
@@ -235,6 +237,7 @@ test('End-to-End: Peer A fetches via HTTP, Peer B streams asset from Peer A over
   net.httpAssets.set(testUrl, expectedBlob);
 
   const peerA = new ShadowCast({
+    allowUnverifiedPeers: true,
     signalingUrl: 'ws://virtual/ws',
     chunkSize: 128,
     peerWaitTimeout: 50,
@@ -243,6 +246,7 @@ test('End-to-End: Peer A fetches via HTTP, Peer B streams asset from Peer A over
   });
 
   const peerB = new ShadowCast({
+    allowUnverifiedPeers: true,
     signalingUrl: 'ws://virtual/ws',
     chunkSize: 128,
     peerWaitTimeout: 200,
@@ -297,6 +301,7 @@ test('End-to-End: Multi-peer swarm parallel transfer across 3 connected peers', 
   net.httpAssets.set(testUrl, expectedBlob);
 
   const seeder1 = new ShadowCast({
+    allowUnverifiedPeers: true,
     signalingUrl: 'ws://virtual/ws',
     chunkSize: 64,
     peerWaitTimeout: 30,
@@ -305,6 +310,7 @@ test('End-to-End: Multi-peer swarm parallel transfer across 3 connected peers', 
   });
 
   const seeder2 = new ShadowCast({
+    allowUnverifiedPeers: true,
     signalingUrl: 'ws://virtual/ws',
     chunkSize: 64,
     peerWaitTimeout: 150,
@@ -313,6 +319,7 @@ test('End-to-End: Multi-peer swarm parallel transfer across 3 connected peers', 
   });
 
   const leecher = new ShadowCast({
+    allowUnverifiedPeers: true,
     signalingUrl: 'ws://virtual/ws',
     chunkSize: 64,
     peerWaitTimeout: 150,
@@ -356,6 +363,7 @@ test('End-to-End: P2P timeout falls back cleanly to HTTP when peers do not have 
   net.httpAssets.set(uncachedUrl, expectedBlob);
 
   const peerA = new ShadowCast({
+    allowUnverifiedPeers: true,
     signalingUrl: 'ws://virtual/ws',
     peerWaitTimeout: 50,
     p2pTimeout: 80, // Short P2P timeout for fast test
@@ -363,6 +371,7 @@ test('End-to-End: P2P timeout falls back cleanly to HTTP when peers do not have 
   });
 
   const peerB = new ShadowCast({
+    allowUnverifiedPeers: true,
     signalingUrl: 'ws://virtual/ws',
     peerWaitTimeout: 50,
     p2pTimeout: 80,
@@ -397,6 +406,7 @@ test('End-to-End: Graceful HTTP fallback when signaling server is unreachable an
   net.httpAssets.set(testUrl, expectedBlob);
 
   const client = new ShadowCast({
+    allowUnverifiedPeers: true,
     signalingUrl: 'ws://offline-server/ws',
     cache: { driver: 'memory' },
   });
@@ -409,8 +419,8 @@ test('End-to-End: Graceful HTTP fallback when signaling server is unreachable an
       client.requestAsset(testUrl),
     ]);
 
-    assert.equal(url1, url2);
-    assert.equal(url2, url3);
+    assert.notEqual(url1, url2);
+    assert.notEqual(url2, url3);
     assert.equal(
       net.httpRequestsCount,
       1,
@@ -420,4 +430,126 @@ test('End-to-End: Graceful HTTP fallback when signaling server is unreachable an
   } finally {
     client.destroy();
   }
+});
+
+test('Unpinned URLs use anonymous HTTP and private responses are not cached or seeded', async (t) => {
+  const client = new ShadowCast({ cache: { driver: 'memory' } });
+  t.after(() => client.destroy());
+  let requests = 0;
+  t.mock.method(globalThis, 'fetch', async (_url: string, init: RequestInit) => {
+    requests++;
+    assert.equal(init.credentials, 'omit');
+    return new Response('private content', { headers: { 'Cache-Control': 'private, max-age=60' } });
+  });
+  const url = 'https://example.com/private';
+  assert.equal(await (await client.requestAssetBlob(url)).text(), 'private content');
+  await client.requestAssetBlob(url);
+  assert.equal(requests, 2);
+  assert.equal(client.stats.cacheHits, 0);
+});
+
+test('Pinned assets reject altered origin bytes and replace the MIME type with trusted metadata', async (t) => {
+  const url = 'https://example.com/pinned.svg';
+  const sha256 = await hashBlob(new Blob(['expected']));
+  const client = new ShadowCast({ assetIntegrity: { [url]: { sha256, mimeType: 'image/svg+xml' } }, cache: { driver: 'memory' } });
+  t.after(() => client.destroy());
+  const rtc = globalThis.RTCPeerConnection;
+  Reflect.deleteProperty(globalThis, 'RTCPeerConnection');
+  t.after(() => { globalThis.RTCPeerConnection = rtc; });
+  let body = 'altered';
+  const fetch = t.mock.method(globalThis, 'fetch', async () => new Response(body, {
+    headers: { 'Content-Type': 'text/html' },
+  }));
+  await assert.rejects(client.requestAssetBlob(url), /pinned SHA-256/);
+  body = 'expected';
+  const blob = await client.requestAssetBlob(url);
+  assert.equal(blob.type, 'image/svg+xml');
+  assert.equal(await blob.text(), 'expected');
+  assert.equal(await (await client.requestAssetBlob(url)).text(), 'expected');
+  assert.equal(fetch.mock.callCount(), 2);
+});
+
+test('HTTP timeout and destruction abort origin work and revoke owned ObjectURLs', async (t) => {
+  const url = 'https://example.com/slow';
+  const client = new ShadowCast({ httpTimeout: 15, cache: { driver: 'memory' } });
+  t.after(() => client.destroy());
+  let markStarted!: () => void;
+  let started = new Promise<void>((resolve) => { markStarted = resolve; });
+  const mock = t.mock.method(globalThis, 'fetch', async (_url: string, init: RequestInit) => {
+    const signal = init.signal!;
+    markStarted();
+    return new Promise<Response>((_, reject) => {
+      signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+    });
+  });
+  await assert.rejects(client.requestAssetBlob(url), /HTTP request timed out/);
+  started = new Promise<void>((resolve) => { markStarted = resolve; });
+  const pending = client.requestAssetBlob(url);
+  await started;
+  client.destroy();
+  await assert.rejects(pending, /destroyed/);
+  await assert.rejects(client.requestAssetBlob(url), /destroyed/);
+  mock.mock.restore();
+
+  const other = new ShadowCast({ cache: { driver: 'memory' } });
+  t.after(() => other.destroy());
+  t.mock.method(globalThis, 'fetch', async () => new Response('asset'));
+  const release = t.mock.method(URL, 'revokeObjectURL');
+  const first = await other.requestAsset(url);
+  const second = await other.requestAsset(url);
+  other.releaseAsset(first);
+  other.destroy();
+  assert.deepEqual(release.mock.calls.map((call) => call.arguments[0]), [first, second]);
+});
+
+test('A peer cannot bypass the trusted digest by advertising forged asset metadata', async (t) => {
+  const net = new VirtualNetworkEnvironment();
+  net.install();
+  const url = 'https://example.com/immutable.dat';
+  const valid = new Blob(['authentic']);
+  const sha256 = await hashBlob(valid);
+  net.httpAssets.set(url, new Blob(['malicious']));
+  const seeder = new ShadowCast({ allowUnverifiedPeers: true, cache: { driver: 'memory' } });
+  const receiver = new ShadowCast({
+    assetIntegrity: { [url]: { sha256, mimeType: 'application/octet-stream' } },
+    verifyIntegrity: false,
+    cache: { driver: 'memory' },
+  });
+  t.after(() => { receiver.destroy(); seeder.destroy(); });
+  await seeder.requestAssetBlob(url);
+  net.httpAssets.set(url, valid);
+  await receiver.connect();
+  assert.equal(await receiver.waitForPeers({ timeout: 500 }), true);
+  for (const connection of net.peerConnections.values()) {
+    for (const channel of [connection.localChannel, connection.localChannel?.remoteChannel]) {
+      if (!channel) continue;
+      const send = channel.send.bind(channel);
+      channel.send = (data: ArrayBuffer | string) => {
+        if (typeof data === 'string') {
+          const message = JSON.parse(data);
+          if (message.assetHash) data = JSON.stringify({ ...message, assetHash: sha256 });
+        }
+        send(data);
+      };
+    }
+  }
+
+  const errors: string[] = [];
+  receiver.on('transfer:error', ({ error }) => errors.push(error.message));
+  assert.equal(await (await receiver.requestAssetBlob(url)).text(), 'authentic');
+  assert.equal(receiver.stats.totalP2PBytes, 0);
+  assert.equal(receiver.stats.totalHttpBytes, valid.size);
+  assert.equal(net.httpRequestsCount, 2);
+  assert.match(errors[0], /pinned SHA-256/);
+});
+
+test('Origin cache freshness respects Age and max-age', async (t) => {
+  const client = new ShadowCast({ cache: { driver: 'memory' } });
+  t.after(() => client.destroy());
+  const fetch = t.mock.method(globalThis, 'fetch', async () => new Response('stale', {
+    headers: { 'Cache-Control': 'public, max-age=60', Age: '61' },
+  }));
+  await client.requestAssetBlob('https://example.com/stale');
+  await client.requestAssetBlob('https://example.com/stale');
+  assert.equal(fetch.mock.callCount(), 2);
 });

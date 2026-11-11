@@ -7,6 +7,7 @@ export interface CacheEntryMetadata {
   size: number;
   mimeType: string;
   assetHash?: string;
+  expiresAt?: number;
   storedAt: number;
   lastAccessedAt: number;
   accessCount: number;
@@ -15,6 +16,8 @@ export interface CacheEntryMetadata {
 export interface CacheEntry extends CacheEntryMetadata {
   blob: Blob;
 }
+
+export type CacheWriteOptions = Pick<CacheEntryMetadata, 'assetHash' | 'expiresAt'>;
 
 export interface CacheConfig {
   driver?: 'indexeddb' | 'memory';
@@ -25,7 +28,7 @@ export interface CacheConfig {
 
 export interface CacheStore {
   get(url: string): Promise<Blob | undefined>;
-  set(url: string, blob: Blob, meta?: { assetHash?: string }): Promise<void>;
+  set(url: string, blob: Blob, meta?: CacheWriteOptions): Promise<void>;
   has(url: string): Promise<boolean>;
   delete(url: string): Promise<boolean>;
   clear(): Promise<void>;

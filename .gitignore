@@ -37,3 +37,9 @@ coverage/
 # Demo specific
 demo/.next/
 demo/out/
+
+library/.test-dist/
+demo/public/shadowcast-sw.js
+playwright-report/
+test-results/
+demo/next-env.d.ts

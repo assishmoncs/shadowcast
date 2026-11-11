@@ -1,185 +1,113 @@
-/**
- * ShadowCast - Service Worker Script
- * Intercepts HTTP requests and routes them to the ShadowCast P2P client in the main thread.
- */
+/// <reference lib="webworker" />
 
-// Context typing for Service Worker environment under DOM tsconfig
-type ExtendableEvent = Event & {
-  waitUntil(fn: Promise<any>): void;
-};
+import type { SWAssetResponseMessage, SWConfigMessage, SWPattern } from './types.js';
 
-type FetchEvent = ExtendableEvent & {
-  request: Request;
-  respondWith(response: Promise<Response> | Response): void;
-};
-
-interface WindowClient {
-  id: string;
-  url: string;
-  postMessage(message: any, transfer?: Transferable[]): void;
+const worker = self as unknown as ServiceWorkerGlobalScope;
+interface ClientConfig {
+  urls?: Set<string>;
+  include: RegExp[];
+  exclude: RegExp[];
+  timeout: number;
 }
-
-interface Clients {
-  claim(): Promise<void>;
-  matchAll(options?: { type?: string; includeUncontrolled?: boolean }): Promise<WindowClient[]>;
-}
-
-const sw = self as unknown as {
-  addEventListener(type: 'install', listener: (event: ExtendableEvent) => void): void;
-  addEventListener(type: 'activate', listener: (event: ExtendableEvent) => void): void;
-  addEventListener(type: 'fetch', listener: (event: FetchEvent) => void): void;
-  addEventListener(type: 'message', listener: (event: MessageEvent) => void): void;
-  skipWaiting(): Promise<void>;
-  clients: Clients;
-};
-
-const DEFAULT_PATTERNS: RegExp[] = [
-  /\.(png|jpe?g|gif|webp|svg|avif|ico|mp4|webm|mp3|wasm|woff2?)(\?.*)?$/i,
+const configurations = new Map<string, ClientConfig | null>();
+const originalHeaders = [
+  'authorization', 'range', 'if-range', 'if-match', 'if-none-match', 'if-modified-since', 'if-unmodified-since',
 ];
 
-let includePatterns: RegExp[] = [...DEFAULT_PATTERNS];
-let excludePatterns: RegExp[] = [];
-let requestTimeoutMs = 8000;
-
-function generateRequestId(): string {
-  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+function patterns(input: (string | SWPattern)[] | undefined, defaults: RegExp[]): RegExp[] {
+  if (!Array.isArray(input)) return defaults;
+  return input.flatMap((entry) => {
     try {
-      return crypto.randomUUID();
+      if (typeof entry === 'string') return new RegExp(entry, 'i');
+      return new RegExp(entry.source, entry.flags.replace(/[gy]/g, ''));
     } catch {
-      // Fallback
+      return [];
     }
-  }
-  return `sc-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  });
 }
 
-function shouldInterceptUrl(rawUrl: string): boolean {
-  let pathname = rawUrl;
-  try {
-    pathname = new URL(rawUrl).pathname;
-  } catch {
-    // Use rawUrl if parsing fails
-  }
-
-  for (const exclude of excludePatterns) {
-    if (exclude.test(rawUrl) || exclude.test(pathname)) {
-      return false;
-    }
-  }
-
-  return includePatterns.some((pattern) => pattern.test(rawUrl) || pattern.test(pathname));
+function rememberClient(id: string, config: ClientConfig | null): void {
+  configurations.delete(id);
+  configurations.set(id, config);
+  if (configurations.size > 128) configurations.delete(configurations.keys().next().value!);
 }
 
-if (typeof sw !== 'undefined' && typeof sw.addEventListener === 'function') {
-  sw.addEventListener('install', (event: ExtendableEvent) => {
-    event.waitUntil(sw.skipWaiting());
-  });
+worker.addEventListener('install', (event) => { event.waitUntil(worker.skipWaiting()); });
+worker.addEventListener('activate', (event) => { event.waitUntil(worker.clients.claim()); });
+worker.addEventListener('message', (event) => {
+  const data = event.data as SWConfigMessage;
+  const client = event.source;
+  if (data?.type !== 'SHADOWCAST_SW_CONFIG' || !client || !('id' in client)) return;
+  const config: ClientConfig = {
+    urls: Array.isArray(data.assetUrls) ? new Set(data.assetUrls) : undefined,
+    include: patterns(data.includePatterns, []),
+    exclude: patterns(data.excludePatterns, []),
+    timeout: Number.isFinite(data.timeoutMs) && data.timeoutMs! > 0 ? Math.min(data.timeoutMs!, 30_000) : 8000,
+  };
+  // A closed tab leaves no registrations behind when the worker restarts.
+  rememberClient(client.id, config);
+});
 
-  sw.addEventListener('activate', (event: ExtendableEvent) => {
-    event.waitUntil(sw.clients.claim());
-  });
-
-  sw.addEventListener('message', (event: MessageEvent) => {
-    const data = event.data;
-    if (!data || data.type !== 'SHADOWCAST_SW_CONFIG') return;
-
-    if (Array.isArray(data.includePatterns) && data.includePatterns.length > 0) {
-      includePatterns = data.includePatterns.map((p: string) => new RegExp(p, 'i'));
+function requestBlob(client: Client, url: string, timeout: number): Promise<Blob | undefined> {
+  const id = crypto.randomUUID();
+  const channel = new MessageChannel();
+  return new Promise((resolve) => {
+    const finish = (blob?: Blob) => {
+      clearTimeout(timer);
+      channel.port1.close();
+      resolve(blob);
+    };
+    const timer = setTimeout(finish, timeout);
+    channel.port1.onmessageerror = () => finish();
+    channel.port1.onmessage = ({ data }: MessageEvent<SWAssetResponseMessage>) => {
+      if (data?.id === id && data.type === 'SHADOWCAST_SW_RESPONSE') {
+        finish(data.success && data.blob instanceof Blob ? data.blob : undefined);
+      }
+    };
+    try {
+      client.postMessage({ type: 'SHADOWCAST_SW_REQUEST', id, url }, [channel.port2]);
+    } catch {
+      channel.port2.close();
+      finish();
     }
-    if (Array.isArray(data.excludePatterns)) {
-      excludePatterns = data.excludePatterns.map((p: string) => new RegExp(p, 'i'));
-    }
-    if (typeof data.timeoutMs === 'number' && data.timeoutMs > 0) {
-      requestTimeoutMs = data.timeoutMs;
-    }
-  });
-
-  sw.addEventListener('fetch', (event: FetchEvent) => {
-    const request = event.request;
-    const url = request.url;
-
-    // Only intercept GET requests
-    if (request.method !== 'GET') {
-      return;
-    }
-
-    // Check if URL matches static asset extensions or configured patterns
-    if (!shouldInterceptUrl(url)) {
-      return;
-    }
-
-    event.respondWith(
-      (async () => {
-        try {
-          // Find an active window client running ShadowCast
-          const allClients = await sw.clients.matchAll({
-            type: 'window',
-            includeUncontrolled: true,
-          });
-          if (!allClients || allClients.length === 0) {
-            return fetch(request);
-          }
-
-          const client = allClients[0];
-          const requestId = generateRequestId();
-
-          // Create a MessageChannel to receive the response
-          const channel = new MessageChannel();
-
-          const responsePromise = new Promise<Response>((resolve, reject) => {
-            const timeout = setTimeout(() => {
-              try {
-                channel.port1.close();
-              } catch {
-                // Ignore
-              }
-              reject(new Error('ShadowCast SW request timed out'));
-            }, requestTimeoutMs);
-
-            channel.port1.onmessage = (msgEvent) => {
-              clearTimeout(timeout);
-              try {
-                channel.port1.close();
-              } catch {
-                // Ignore
-              }
-              const data = msgEvent.data;
-
-              if (data && data.success && data.blob) {
-                const headers = new Headers();
-                headers.set(
-                  'Content-Type',
-                  data.mimeType || data.blob.type || 'application/octet-stream'
-                );
-                headers.set('X-ShadowCast-Source', 'P2P-ServiceWorker');
-
-                resolve(
-                  new Response(data.blob, {
-                    status: 200,
-                    headers,
-                  })
-                );
-              } else {
-                reject(new Error(data?.error || 'ShadowCast SW failed to load asset'));
-              }
-            };
-          });
-
-          // Send request to client window
-          client.postMessage(
-            {
-              type: 'SHADOWCAST_SW_REQUEST',
-              id: requestId,
-              url,
-            },
-            [channel.port2]
-          );
-
-          return await responsePromise;
-        } catch {
-          // Fallback to origin network fetch on any error
-          return fetch(request);
-        }
-      })()
-    );
   });
 }
+
+worker.addEventListener('fetch', (event) => {
+  const { request, clientId } = event;
+  if (!clientId || request.method !== 'GET' || request.mode === 'navigate' ||
+      request.integrity || request.cache !== 'default' || originalHeaders.some((header) => request.headers.has(header))) return;
+
+  const url = new URL(request.url);
+  if (url.origin !== worker.location.origin) return;
+  const config = configurations.get(clientId);
+  if (config === undefined) {
+    // After an idle worker restarts, restore the page's configuration without delaying this fetch.
+    rememberClient(clientId, null);
+    event.waitUntil(worker.clients.get(clientId).then((client) => {
+      client?.postMessage({ type: 'SHADOWCAST_SW_CONFIG_REQUEST' });
+    }).catch(() => {}));
+    return;
+  }
+  if (!config || (config.urls && !config.urls.has(url.href))) return;
+  const matches = (pattern: RegExp) => pattern.test(url.href) || pattern.test(url.pathname);
+  if (!config.include.some(matches) || config.exclude.some(matches)) return;
+
+  event.respondWith((async () => {
+    let blob: Blob | undefined;
+    try {
+      const client = await worker.clients.get(clientId);
+      if (client) blob = await requestBlob(client, url.href, config.timeout);
+    } catch {
+      // The initiating client may have navigated away.
+    }
+    if (!blob) return fetch(request);
+    return new Response(blob, {
+      headers: {
+        'Content-Type': blob.type || 'application/octet-stream',
+        'X-Content-Type-Options': 'nosniff',
+        'X-ShadowCast-Source': 'service-worker',
+      },
+    });
+  })());
+});

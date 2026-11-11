@@ -2,7 +2,7 @@
  * ShadowCast - In-Memory Cache Store with LRU Eviction
  */
 
-import { CacheConfig, CacheEntry, CacheStore } from './types.js';
+import { CacheConfig, CacheEntry, CacheStore, CacheWriteOptions } from './types.js';
 import { LRUPolicy } from './LRUPolicy.js';
 
 export class MemoryCache implements CacheStore {
@@ -14,7 +14,6 @@ export class MemoryCache implements CacheStore {
   }
 
   private pruneExpired(): void {
-    if (this.lruPolicy.ttlMs <= 0) return;
     const now = Date.now();
     for (const [url, entry] of this.entries.entries()) {
       if (this.lruPolicy.isExpired(entry, now)) {
@@ -39,7 +38,7 @@ export class MemoryCache implements CacheStore {
     return entry.blob;
   }
 
-  async set(url: string, blob: Blob, meta?: { assetHash?: string }): Promise<void> {
+  async set(url: string, blob: Blob, meta?: CacheWriteOptions): Promise<void> {
     if (this.lruPolicy.maxEntries <= 0 || blob.size > this.lruPolicy.maxSizeBytes) {
       this.pruneExpired();
       return;
@@ -59,6 +58,7 @@ export class MemoryCache implements CacheStore {
       size: blob.size,
       mimeType: blob.type || 'application/octet-stream',
       assetHash: meta?.assetHash,
+      expiresAt: meta?.expiresAt,
       storedAt: now,
       lastAccessedAt: now,
       accessCount: 1,
