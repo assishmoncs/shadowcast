@@ -2,13 +2,15 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -16,337 +18,370 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-// ---------- Types ----------
-
-type Client struct {
-	id          string
-	conn        *websocket.Conn
-	room        string
-	rateLimiter *RateLimiter
-	mu          sync.Mutex
-}
-
-// ---------- Global state ----------
-
-var (
-	appConfig   *Config
-	rooms       = make(map[string]map[*Client]bool)
-	clientsById = make(map[string]*Client)
-	globalMu    sync.RWMutex
-	upgrader    websocket.Upgrader
+const (
+	writeTimeout      = 5 * time.Second
+	outboundQueueSize = 128
+	maxNameBytes      = 128
 )
 
-func main() {
-	appConfig = LoadConfig()
+type Client struct {
+	id       string
+	room     string
+	conn     *websocket.Conn
+	outbound chan []byte
+	done     chan struct{}
+}
 
-	// Initialize structured logger
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-	slog.SetDefault(logger)
+type SignalingServer struct {
+	config   Config
+	upgrader websocket.Upgrader
+	mux      *http.ServeMux
+	metrics  ServerMetrics
 
-	// Configure WebSocket upgrader with origin checking
-	upgrader = websocket.Upgrader{
-		CheckOrigin: func(r *http.Request) bool {
-			if len(appConfig.AllowedOrigins) == 0 {
-				return true // dev mode: allow all
-			}
-			origin := r.Header.Get("Origin")
-			for _, allowed := range appConfig.AllowedOrigins {
-				if allowed == "*" || allowed == origin {
+	mu      sync.Mutex
+	rooms   map[string]map[*Client]struct{}
+	clients map[string]*Client
+	closing bool
+}
+
+type signalMessage struct {
+	Type      string              `json:"type"`
+	Room      string              `json:"room,omitempty"`
+	From      string              `json:"from,omitempty"`
+	Target    string              `json:"target,omitempty"`
+	SDP       *sessionDescription `json:"sdp,omitempty"`
+	Candidate *iceCandidate       `json:"candidate,omitempty"`
+}
+
+type sessionDescription struct {
+	Type string `json:"type"`
+	SDP  string `json:"sdp"`
+}
+
+type iceCandidate struct {
+	Candidate        string  `json:"candidate"`
+	SDPMid           *string `json:"sdpMid,omitempty"`
+	SDPMLineIndex    *uint16 `json:"sdpMLineIndex,omitempty"`
+	UsernameFragment *string `json:"usernameFragment,omitempty"`
+}
+
+func newSignalingServer(cfg *Config) *SignalingServer {
+	s := &SignalingServer{
+		config:  *cfg,
+		mux:     http.NewServeMux(),
+		metrics: ServerMetrics{startTime: time.Now()},
+		rooms:   make(map[string]map[*Client]struct{}),
+		clients: make(map[string]*Client),
+	}
+	s.upgrader = websocket.Upgrader{HandshakeTimeout: writeTimeout}
+	if len(s.config.AllowedOrigins) > 0 {
+		s.upgrader.CheckOrigin = func(r *http.Request) bool {
+			for _, allowed := range s.config.AllowedOrigins {
+				if allowed == "*" || strings.EqualFold(allowed, r.Header.Get("Origin")) {
 					return true
 				}
 			}
-			slog.Warn("WebSocket origin rejected", "origin", origin)
 			return false
-		},
-	}
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", handleHealthz)
-	mux.HandleFunc("/ready", handleReady)
-	mux.HandleFunc("/metrics", handleMetrics)
-	mux.HandleFunc("/ws", handleWebSocket)
-
-	server := &http.Server{
-		Addr:         appConfig.Port,
-		Handler:      mux,
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 15 * time.Second,
-		IdleTimeout:  60 * time.Second,
-	}
-
-	// Setup graceful shutdown
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
-	go func() {
-		slog.Info("Signaling server listening", "port", appConfig.Port)
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			slog.Error("Server error", "error", err)
-			os.Exit(1)
 		}
-	}()
-
-	<-ctx.Done()
-	slog.Info("Shutting down signaling server gracefully...")
-
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	if err := server.Shutdown(shutdownCtx); err != nil {
-		slog.Error("Server shutdown failed", "error", err)
 	}
-
-	slog.Info("Signaling server stopped")
+	s.mux.HandleFunc("/healthz", handleHealthz)
+	s.mux.HandleFunc("/ready", s.handleReady)
+	s.mux.HandleFunc("/metrics", s.handleMetrics)
+	s.mux.HandleFunc("/ws", s.handleWebSocket)
+	return s
 }
 
-// ---------- WebSocket Handler ----------
+func (s *SignalingServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	s.mux.ServeHTTP(w, r)
+}
 
-func handleWebSocket(w http.ResponseWriter, r *http.Request) {
-	// Check optional Auth Token header or query param
-	if appConfig.AuthToken != "" {
+func main() {
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
+	cfg := LoadConfig()
+	handler := newSignalingServer(cfg)
+	server := &http.Server{
+		Addr:              cfg.Port,
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	listenErr := make(chan error, 1)
+	go func() {
+		slog.Info("Signaling server listening", "address", cfg.Port)
+		listenErr <- server.ListenAndServe()
+	}()
+	select {
+	case err := <-listenErr:
+		if !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("Signaling server failed", "error", err)
+			os.Exit(1)
+		}
+	case <-ctx.Done():
+		handler.close()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			slog.Error("Server shutdown failed", "error", err)
+		}
+	}
+}
+
+func (s *SignalingServer) handleWebSocket(w http.ResponseWriter, r *http.Request) {
+	if s.config.AuthToken != "" {
 		token := r.Header.Get("X-Auth-Token")
 		if token == "" {
 			token = r.URL.Query().Get("token")
 		}
-		if token != appConfig.AuthToken {
+		if subtle.ConstantTimeCompare([]byte(token), []byte(s.config.AuthToken)) != 1 {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
 	}
 
-	conn, err := upgrader.Upgrade(w, r, nil)
+	conn, err := s.upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		slog.Warn("WebSocket upgrade error", "error", err)
 		return
 	}
 	defer conn.Close()
-
-	// Enforce message read limit
-	conn.SetReadLimit(appConfig.ReadLimitBytes)
-
+	conn.SetReadLimit(s.config.ReadLimitBytes)
+	if s.config.PongWait > 0 {
+		_ = conn.SetReadDeadline(time.Now().Add(s.config.PongWait))
+		conn.SetPongHandler(func(string) error {
+			return conn.SetReadDeadline(time.Now().Add(s.config.PongWait))
+		})
+	}
 	client := &Client{
-		id:          uuid.New().String(),
-		conn:        conn,
-		rateLimiter: NewRateLimiter(appConfig.RateLimitPerSec),
+		id:       uuid.NewString(),
+		conn:     conn,
+		outbound: make(chan []byte, outboundQueueSize),
+		done:     make(chan struct{}),
 	}
 
-	atomic.AddUint64(&metrics.totalConnections, 1)
-	atomic.AddInt64(&metrics.activeConnections, 1)
-	defer atomic.AddInt64(&metrics.activeConnections, -1)
+	s.mu.Lock()
+	if s.closing || (s.config.MaxConnections > 0 && len(s.clients) >= s.config.MaxConnections) {
+		s.mu.Unlock()
+		_ = conn.WriteControl(websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseTryAgainLater, "Server unavailable"),
+			time.Now().Add(writeTimeout))
+		return
+	}
+	s.clients[client.id] = client
+	s.metrics.totalConnections.Add(1)
+	s.enqueueJSON(client, map[string]string{"type": "self-id", "id": client.id})
+	s.mu.Unlock()
 
-	globalMu.Lock()
-	clientsById[client.id] = client
-	globalMu.Unlock()
-
-	slog.Debug("Client connected", "client_id", client.id)
-
-	sendJSON(client, map[string]string{
-		"type": "self-id",
-		"id":   client.id,
-	})
-
-	defer func() {
-		globalMu.Lock()
-		delete(clientsById, client.id)
-		globalMu.Unlock()
-		handleDisconnect(client)
-	}()
-
+	defer s.disconnect(client)
+	go s.writeLoop(client)
+	limiter := NewRateLimiter(s.config.RateLimitPerSec)
 	for {
-		_, message, err := conn.ReadMessage()
+		kind, data, err := conn.ReadMessage()
 		if err != nil {
-			break
+			return
 		}
-
-		atomic.AddUint64(&metrics.totalMessagesIn, 1)
-
-		// Rate limit incoming messages per client
-		if !client.rateLimiter.Allow() {
-			atomic.AddUint64(&metrics.totalRateLimitHits, 1)
-			slog.Warn("Rate limit exceeded for client", "client_id", client.id)
-			sendJSON(client, map[string]string{
-				"type":  "error",
-				"error": "Rate limit exceeded. Slow down message frequency.",
-			})
+		s.metrics.totalMessagesIn.Add(1)
+		if !limiter.Allow() {
+			s.metrics.totalRateLimitHits.Add(1)
+			s.sendError(client, "Rate limit exceeded")
 			continue
 		}
-
-		var msg map[string]interface{}
-		if err := json.Unmarshal(message, &msg); err != nil {
+		var msg signalMessage
+		if kind != websocket.TextMessage || json.Unmarshal(data, &msg) != nil || msg.Type == "" {
+			s.sendError(client, "Invalid signaling message")
 			continue
 		}
-
-		msgType, _ := msg["type"].(string)
-
-		switch msgType {
+		switch msg.Type {
 		case "join":
-			room, _ := msg["room"].(string)
-			if room == "" {
-				continue
-			}
-
-			// Validate room capacity limits
-			globalMu.Lock()
-			if len(rooms) >= appConfig.MaxRooms && rooms[room] == nil {
-				globalMu.Unlock()
-				sendJSON(client, map[string]string{
-					"type":  "error",
-					"error": "Server maximum room capacity reached",
-				})
-				continue
-			}
-
-			if rooms[room] != nil && len(rooms[room]) >= appConfig.MaxClientsPerRoom {
-				globalMu.Unlock()
-				sendJSON(client, map[string]string{
-					"type":  "error",
-					"error": "Room is full",
-				})
-				continue
-			}
-			globalMu.Unlock()
-
-			client.room = room
-			joinRoom(client, room)
-
+			s.join(client, strings.TrimSpace(msg.Room), strings.TrimSpace(msg.From))
 		case "offer", "answer", "ice-candidate":
-			target, _ := msg["target"].(string)
-			if target == "" {
-				broadcastToRoom(client.room, message, client)
-				continue
-			}
-
-			msg["from"] = client.id
-			enriched, err := json.Marshal(msg)
-			if err != nil {
-				continue
-			}
-			sendToTarget(target, enriched)
+			s.relay(client, msg)
+		default:
+			s.sendError(client, "Unsupported signaling message")
 		}
 	}
 }
 
-// ---------- Room Management ----------
-
-func joinRoom(client *Client, room string) {
-	globalMu.Lock()
-
-	if rooms[room] == nil {
-		rooms[room] = make(map[*Client]bool)
+func (s *SignalingServer) writeLoop(client *Client) {
+	defer client.conn.Close()
+	var ticks <-chan time.Time
+	if s.config.PingInterval > 0 {
+		ticker := time.NewTicker(s.config.PingInterval)
+		defer ticker.Stop()
+		ticks = ticker.C
 	}
-
-	existingPeers := make([]string, 0, len(rooms[room]))
-	for c := range rooms[room] {
-		existingPeers = append(existingPeers, c.id)
-	}
-
-	rooms[room][client] = true
-	globalMu.Unlock()
-
-	slog.Info("Client joined room", "client_id", client.id, "room", room, "peers_count", len(existingPeers))
-
-	sendJSON(client, map[string]interface{}{
-		"type":  "room-peers",
-		"peers": existingPeers,
-	})
-
-	peerJoinedMsg, _ := json.Marshal(map[string]string{
-		"type": "peer-joined",
-		"id":   client.id,
-	})
-
-	globalMu.RLock()
-	for c := range rooms[room] {
-		if c != client {
-			writeMessage(c, peerJoinedMsg)
+	for {
+		select {
+		case <-client.done:
+			return
+		case msg := <-client.outbound:
+			_ = client.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+			if err := client.conn.WriteMessage(websocket.TextMessage, msg); err != nil {
+				return
+			}
+			s.metrics.totalMessagesOut.Add(1)
+		case <-ticks:
+			if err := client.conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(writeTimeout)); err != nil {
+				return
+			}
 		}
 	}
-	globalMu.RUnlock()
 }
 
-func sendToTarget(targetID string, message []byte) {
-	globalMu.RLock()
-	target, ok := clientsById[targetID]
-	globalMu.RUnlock()
+func (s *SignalingServer) enqueue(client *Client, message []byte) {
+	select {
+	case client.outbound <- message:
+	default:
+		// Closing the connection unblocks its reader and writer, even during a slow write.
+		_ = client.conn.Close()
+	}
+}
 
-	if !ok {
+func (s *SignalingServer) enqueueJSON(client *Client, message any) {
+	if data, err := json.Marshal(message); err == nil {
+		s.enqueue(client, data)
+	}
+}
+
+func (s *SignalingServer) sendError(client *Client, message string) {
+	s.enqueueJSON(client, map[string]string{"type": "error", "error": message})
+}
+
+// Room membership and enqueue order share one lock. A room acknowledgment is
+// queued before any peer can relay signaling to its new member.
+func (s *SignalingServer) join(client *Client, room, requestedID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closing {
 		return
 	}
-	writeMessage(target, message)
-}
-
-func broadcastToRoom(room string, message []byte, sender *Client) {
-	globalMu.RLock()
-	defer globalMu.RUnlock()
-
-	for c := range rooms[room] {
-		if c != sender {
-			writeMessage(c, message)
-		}
-	}
-}
-
-func writeMessage(c *Client, message []byte) {
-	c.mu.Lock()
-	err := c.conn.WriteMessage(websocket.TextMessage, message)
-	c.mu.Unlock()
-
-	if err != nil {
-		slog.Debug("writeMessage failed, disconnecting", "client_id", c.id, "error", err)
-		go handleDisconnect(c)
-	} else {
-		atomic.AddUint64(&metrics.totalMessagesOut, 1)
-	}
-}
-
-func rawWrite(c *Client, message []byte) {
-	c.mu.Lock()
-	err := c.conn.WriteMessage(websocket.TextMessage, message)
-	c.mu.Unlock()
-
-	if err == nil {
-		atomic.AddUint64(&metrics.totalMessagesOut, 1)
-	}
-}
-
-func sendJSON(c *Client, v interface{}) {
-	data, err := json.Marshal(v)
-	if err != nil {
+	if room == "" || len(room) > maxNameBytes || len(requestedID) > maxNameBytes {
+		s.sendError(client, "Invalid room or peer ID")
 		return
 	}
-	writeMessage(c, data)
+	if client.room != "" && requestedID != "" && requestedID != client.id {
+		s.sendError(client, "Peer ID cannot change after joining")
+		return
+	}
+	if owner := s.clients[requestedID]; owner != nil && owner != client {
+		s.sendError(client, "Peer ID is already in use")
+		return
+	}
+	members := s.rooms[room]
+	roomCount := len(s.rooms)
+	if client.room != room && len(s.rooms[client.room]) == 1 {
+		roomCount--
+	}
+	if members == nil && roomCount >= s.config.MaxRooms {
+		s.sendError(client, "Server maximum room capacity reached")
+		return
+	}
+	if client.room != room && len(members) >= s.config.MaxClientsPerRoom {
+		s.sendError(client, "Room is full")
+		return
+	}
+
+	newMember := client.room != room
+	if newMember {
+		s.leaveLocked(client)
+		if requestedID != "" && requestedID != client.id {
+			delete(s.clients, client.id)
+			client.id = requestedID
+			s.clients[client.id] = client
+		}
+		if members == nil {
+			members = make(map[*Client]struct{})
+			s.rooms[room] = members
+		}
+		members[client] = struct{}{}
+		client.room = room
+	}
+
+	peers := make([]string, 0, len(members)-1)
+	for peer := range members {
+		if peer != client {
+			peers = append(peers, peer.id)
+		}
+	}
+	s.enqueueJSON(client, map[string]any{"type": "room-peers", "id": client.id, "room": room, "peers": peers})
+	if newMember {
+		s.notifyPeersLocked(client, "peer-joined")
+	}
 }
 
-func handleDisconnect(client *Client) {
-	globalMu.Lock()
-
+func (s *SignalingServer) relay(client *Client, msg signalMessage) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closing {
+		return
+	}
 	if client.room == "" {
-		globalMu.Unlock()
+		s.sendError(client, "Join a room before signaling")
 		return
 	}
+	if msg.Type == "ice-candidate" && msg.Candidate == nil ||
+		msg.Type != "ice-candidate" && (msg.SDP == nil || msg.SDP.Type != msg.Type || msg.SDP.SDP == "") {
+		s.sendError(client, "Invalid WebRTC signaling payload")
+		return
+	}
+	msg.From = client.id
+	msg.Room = client.room
+	if msg.Target != "" {
+		peer := s.clients[msg.Target]
+		if peer == nil || peer == client || peer.room != client.room {
+			s.sendError(client, "Target is unavailable in this room")
+			return
+		}
+		s.enqueueJSON(peer, msg)
+		return
+	}
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return
+	}
+	for peer := range s.rooms[client.room] {
+		if peer != client {
+			s.enqueue(peer, data)
+		}
+	}
+}
 
+func (s *SignalingServer) notifyPeersLocked(client *Client, kind string) {
+	msg, _ := json.Marshal(map[string]string{"type": kind, "id": client.id})
+	for peer := range s.rooms[client.room] {
+		if peer != client {
+			s.enqueue(peer, msg)
+		}
+	}
+}
+
+func (s *SignalingServer) leaveLocked(client *Client) {
 	room := client.room
-	delete(rooms[room], client)
-
-	peersToNotify := make([]*Client, 0, len(rooms[room]))
-	for c := range rooms[room] {
-		peersToNotify = append(peersToNotify, c)
+	if room == "" {
+		return
 	}
-
-	if len(rooms[room]) == 0 {
-		delete(rooms, room)
+	delete(s.rooms[room], client)
+	if len(s.rooms[room]) == 0 {
+		delete(s.rooms, room)
+	} else if !s.closing {
+		s.notifyPeersLocked(client, "peer-left")
 	}
-
 	client.room = ""
-	globalMu.Unlock()
+}
 
-	slog.Info("Client disconnected", "client_id", client.id, "room", room)
+func (s *SignalingServer) disconnect(client *Client) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.clients, client.id)
+	s.leaveLocked(client)
+	close(client.done)
+}
 
-	leaveMsg, _ := json.Marshal(map[string]string{
-		"type": "peer-left",
-		"id":   client.id,
-	})
-	for _, c := range peersToNotify {
-		rawWrite(c, leaveMsg)
+func (s *SignalingServer) close() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.closing = true
+	for _, client := range s.clients {
+		_ = client.conn.Close()
 	}
 }

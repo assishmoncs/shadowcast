@@ -1,76 +1,55 @@
-/**
- * ShadowCast - Chunk Sender with SHA-256 Integrity Verification
- */
-
-import { Chunk, DEFAULT_CHUNK_SIZE } from '../core/types.js';
+import { DEFAULT_CHUNK_SIZE, MAX_SWARM_ASSET_BYTES, MAX_SWARM_CHUNKS } from '../core/types.js';
 import { hashBuffer, hashBlob } from '../utils/hash.js';
 
 export class ChunkSender {
-  constructor(private chunkSize: number = DEFAULT_CHUNK_SIZE) {}
+  private readonly chunkSize: number;
 
-  async sendBlob(
-    sendFn: (data: string | ArrayBuffer) => boolean,
-    assetId: string,
-    blob: Blob,
-    specificIndices?: number[]
-  ): Promise<void> {
-    const totalChunks = Math.ceil(blob.size / this.chunkSize);
-    const assetHash = await hashBlob(blob);
-
-    const indicesToSend =
-      specificIndices && specificIndices.length > 0
-        ? specificIndices.filter((idx) => idx >= 0 && idx < totalChunks)
-        : Array.from({ length: totalChunks }, (_, i) => i);
-
-    for (const i of indicesToSend) {
-      const slice = blob.slice(i * this.chunkSize, (i + 1) * this.chunkSize);
-      const buffer = await slice.arrayBuffer();
-      const chunkHash = await hashBuffer(buffer);
-
-      const meta: Chunk = {
-        index: i,
-        total: totalChunks,
-        assetId,
-        chunkHash,
-        assetHash,
-      };
-
-      const metaSent = sendFn(JSON.stringify({ ...meta, type: 'chunk-meta' }));
-      if (!metaSent) return;
-
-      const dataSent = sendFn(buffer);
-      if (!dataSent) return;
-    }
-
-    sendFn(
-      JSON.stringify({
-        type: 'chunk-done',
-        assetId,
-        assetHash,
-        mimeType: blob.type,
-      })
-    );
+  constructor(chunkSize: number = DEFAULT_CHUNK_SIZE) {
+    this.chunkSize = Number.isSafeInteger(chunkSize) && chunkSize > 0
+      ? Math.min(chunkSize, DEFAULT_CHUNK_SIZE)
+      : DEFAULT_CHUNK_SIZE;
   }
 
-  async sendBitfield(
-    sendFn: (data: string) => boolean,
+  async sendBlob(
+    send: (data: string | ArrayBuffer) => boolean,
     assetId: string,
-    url: string,
-    blob: Blob
-  ): Promise<void> {
-    const totalChunks = Math.ceil(blob.size / this.chunkSize);
-    const assetHash = await hashBlob(blob);
+    blob: Blob,
+    specificIndices?: number[],
+    waitForWritable?: (bytes: number) => Promise<boolean>
+  ): Promise<boolean> {
+    const total = Math.ceil(blob.size / this.chunkSize);
+    if (total > MAX_SWARM_CHUNKS || blob.size > MAX_SWARM_ASSET_BYTES) return false;
 
-    sendFn(
-      JSON.stringify({
-        type: 'swarm-bitfield',
-        assetId,
-        url,
-        totalChunks,
-        availableChunks: Array.from({ length: totalChunks }, (_, i) => i),
-        assetHash,
-        mimeType: blob.type,
-      })
-    );
+    const assetHash = await hashBlob(blob);
+    const mimeType = blob.type || 'application/octet-stream';
+    const indices = specificIndices === undefined
+      ? Array.from({ length: total }, (_, i) => i)
+      : Array.from(new Set(specificIndices)).filter((i) => Number.isInteger(i) && i >= 0 && i < total);
+
+    for (const index of indices) {
+      const bytes = await blob.slice(index * this.chunkSize, (index + 1) * this.chunkSize).arrayBuffer();
+      const chunkHash = await hashBuffer(bytes);
+      if (waitForWritable && !await waitForWritable(bytes.byteLength)) return false;
+
+      const meta = { type: 'chunk-meta', assetId, index, total, assetHash, chunkHash, mimeType };
+      if (!send(JSON.stringify(meta)) || !send(bytes)) return false;
+    }
+    return send(JSON.stringify({ type: 'chunk-done', assetId, total, assetHash, mimeType }));
+  }
+
+  async sendBitfield(send: (data: string) => boolean, assetId: string, url: string, blob: Blob): Promise<boolean> {
+    const totalChunks = Math.ceil(blob.size / this.chunkSize);
+    if (totalChunks > MAX_SWARM_CHUNKS || blob.size > MAX_SWARM_ASSET_BYTES) return false;
+    return send(JSON.stringify({
+      type: 'swarm-bitfield',
+      assetId,
+      url,
+      totalChunks,
+      sizeBytes: blob.size,
+      chunkSize: this.chunkSize,
+      availableChunks: Array.from({ length: totalChunks }, (_, i) => i),
+      assetHash: await hashBlob(blob),
+      mimeType: blob.type || 'application/octet-stream',
+    }));
   }
 }

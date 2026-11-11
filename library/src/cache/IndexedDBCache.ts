@@ -1,191 +1,182 @@
-/**
- * ShadowCast - IndexedDB Persistent Cache Store
- */
-
-import { CacheConfig, CacheEntry, CacheEntryMetadata, CacheStore } from './types.js';
+import { CacheConfig, CacheEntry, CacheEntryMetadata, CacheStore, CacheWriteOptions } from './types.js';
 import { LRUPolicy } from './LRUPolicy.js';
 
-const DB_NAME = 'shadowcast_cache_db';
-const STORE_NAME = 'assets';
-const DB_VERSION = 1;
+const ASSETS = 'assets';
+const METADATA = 'metadata';
+const DB_VERSION = 2;
+
+function requestResult<T>(request: IDBRequest<T>): Promise<T> {
+  return new Promise((resolve, reject) => {
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+function metadataFor({ blob: _blob, ...metadata }: CacheEntry): CacheEntryMetadata {
+  return metadata;
+}
 
 export class IndexedDBCache implements CacheStore {
   private dbPromise: Promise<IDBDatabase> | null = null;
-  private lruPolicy: LRUPolicy;
+  private readonly lru: LRUPolicy;
 
-  constructor(config: CacheConfig = {}) {
-    this.lruPolicy = new LRUPolicy(config.maxSizeBytes, config.maxEntries, config.ttlMs);
+  constructor(config: CacheConfig = {}, private readonly dbName = 'shadowcast_cache_db') {
+    this.lru = new LRUPolicy(config.maxSizeBytes, config.maxEntries, config.ttlMs);
   }
 
-  private async getDB(): Promise<IDBDatabase> {
-    if (this.dbPromise) {
-      return this.dbPromise;
-    }
-
-    if (typeof window === 'undefined' || !window.indexedDB) {
-      throw new Error('IndexedDB is not supported in this environment');
-    }
-
-    this.dbPromise = new Promise((resolve, reject) => {
-      const request = indexedDB.open(DB_NAME, DB_VERSION);
-
+  private getDB(): Promise<IDBDatabase> {
+    if (this.dbPromise) return this.dbPromise;
+    const opening = new Promise<IDBDatabase>((resolve, reject) => {
+      const request = indexedDB.open(this.dbName, DB_VERSION);
+      let blocked = false;
+      request.onblocked = () => {
+        blocked = true;
+        reject(new Error('IndexedDB open request was blocked'));
+      };
+      request.onerror = () => reject(request.error);
       request.onupgradeneeded = () => {
         const db = request.result;
-        if (!db.objectStoreNames.contains(STORE_NAME)) {
-          const store = db.createObjectStore(STORE_NAME, { keyPath: 'url' });
-          store.createIndex('lastAccessedAt', 'lastAccessedAt', { unique: false });
-          store.createIndex('storedAt', 'storedAt', { unique: false });
-        }
+        const assets = db.objectStoreNames.contains(ASSETS)
+          ? request.transaction!.objectStore(ASSETS)
+          : db.createObjectStore(ASSETS, { keyPath: 'url' });
+        const metadata = db.createObjectStore(METADATA, { keyPath: 'url' });
+        const cursor = assets.openCursor();
+        cursor.onsuccess = () => {
+          const entry = cursor.result;
+          if (entry) {
+            metadata.put(metadataFor(entry.value));
+            entry.continue();
+          }
+        };
       };
-
-      request.onsuccess = () => resolve(request.result);
-      request.onerror = () => reject(request.error);
+      request.onsuccess = () => {
+        const db = request.result;
+        if (blocked || this.dbPromise !== opening) {
+          db.close();
+          reject(new Error('IndexedDB connection was canceled'));
+          return;
+        }
+        const invalidate = () => {
+          if (this.dbPromise === opening) this.dbPromise = null;
+          db.close();
+        };
+        db.onversionchange = invalidate;
+        db.onclose = invalidate;
+        resolve(db);
+      };
     });
+    this.dbPromise = opening;
+    void opening.catch(() => {
+      if (this.dbPromise === opening) this.dbPromise = null;
+    });
+    return opening;
+  }
 
-    return this.dbPromise;
+  private async transaction<T>(
+    mode: IDBTransactionMode,
+    work: (assets: IDBObjectStore, metadata: IDBObjectStore) => Promise<T>,
+  ): Promise<T> {
+    const db = await this.getDB();
+    const tx = db.transaction([ASSETS, METADATA], mode);
+    const committed = new Promise<void>((resolve, reject) => {
+      tx.oncomplete = () => resolve();
+      tx.onabort = () => reject(tx.error ?? new Error('IndexedDB transaction aborted'));
+    });
+    try {
+      const [result] = await Promise.all([
+        work(tx.objectStore(ASSETS), tx.objectStore(METADATA)),
+        committed,
+      ]);
+      return result;
+    } catch (error) {
+      try { tx.abort(); } catch { /* Transaction already finished. */ }
+      throw error;
+    }
   }
 
   async get(url: string): Promise<Blob | undefined> {
-    try {
-      const db = await this.getDB();
-      const tx = db.transaction(STORE_NAME, 'readwrite');
-      const store = tx.objectStore(STORE_NAME);
-
-      const entry = await new Promise<CacheEntry | undefined>((resolve, reject) => {
-        const req = store.get(url);
-        req.onsuccess = () => resolve(req.result as CacheEntry | undefined);
-        req.onerror = () => reject(req.error);
-      });
-
-      if (!entry) return undefined;
-
-      // TTL check
-      if (this.lruPolicy.ttlMs > 0 && Date.now() - entry.storedAt > this.lruPolicy.ttlMs) {
-        store.delete(url);
-        return undefined;
+    return this.transaction('readwrite', async (assets, metadata) => {
+      const entry: CacheEntryMetadata | undefined = await requestResult(metadata.get(url));
+      if (!entry) return;
+      if (this.lru.isExpired(entry)) {
+        assets.delete(url);
+        metadata.delete(url);
+        return;
       }
 
-      // Update access stats
+      const asset: CacheEntry | undefined = await requestResult(assets.get(url));
+      if (!asset) {
+        metadata.delete(url);
+        return;
+      }
       entry.lastAccessedAt = Date.now();
       entry.accessCount = (entry.accessCount || 0) + 1;
-      store.put(entry);
-
-      return entry.blob;
-    } catch (err) {
-      console.warn('[ShadowCast IndexedDB] Failed to get entry:', err);
-      return undefined;
-    }
+      metadata.put(entry);
+      return asset.blob;
+    });
   }
 
-  async set(url: string, blob: Blob, meta?: { assetHash?: string }): Promise<void> {
-    try {
-      // Execute eviction check
-      const metadataList = await this.getAllMetadata();
-      const toEvict = this.lruPolicy.findEvictionCandidates(metadataList, blob.size);
-      for (const evictUrl of toEvict) {
-        await this.delete(evictUrl);
+  async set(url: string, blob: Blob, meta?: CacheWriteOptions): Promise<void> {
+    if (this.lru.maxEntries <= 0 || blob.size > this.lru.maxSizeBytes) return;
+    await this.transaction('readwrite', async (assets, metadata) => {
+      const entries = await requestResult<CacheEntryMetadata[]>(metadata.getAll());
+      for (const key of this.lru.findEvictionCandidates(entries, blob.size, url)) {
+        assets.delete(key);
+        metadata.delete(key);
       }
-
-      const db = await this.getDB();
-      const tx = db.transaction(STORE_NAME, 'readwrite');
-      const store = tx.objectStore(STORE_NAME);
-
       const now = Date.now();
       const entry: CacheEntry = {
-        url,
-        blob,
-        size: blob.size,
-        mimeType: blob.type,
-        assetHash: meta?.assetHash,
-        storedAt: now,
-        lastAccessedAt: now,
-        accessCount: 1,
+        url, blob, size: blob.size, mimeType: blob.type || 'application/octet-stream',
+        assetHash: meta?.assetHash, expiresAt: meta?.expiresAt, storedAt: now, lastAccessedAt: now, accessCount: 1,
       };
-
-      await new Promise<void>((resolve, reject) => {
-        const req = store.put(entry);
-        req.onsuccess = () => resolve();
-        req.onerror = () => reject(req.error);
-      });
-    } catch (err) {
-      console.warn('[ShadowCast IndexedDB] Failed to set entry:', err);
-    }
-  }
-
-  private async getAllMetadata(): Promise<CacheEntryMetadata[]> {
-    try {
-      const db = await this.getDB();
-      const tx = db.transaction(STORE_NAME, 'readonly');
-      const store = tx.objectStore(STORE_NAME);
-
-      return new Promise<CacheEntryMetadata[]>((resolve, reject) => {
-        const req = store.getAll();
-        req.onsuccess = () => {
-          const list = (req.result as CacheEntry[]) || [];
-          resolve(
-            list.map(({ url, size, mimeType, assetHash, storedAt, lastAccessedAt, accessCount }) => ({
-              url,
-              size,
-              mimeType,
-              assetHash,
-              storedAt,
-              lastAccessedAt,
-              accessCount,
-            }))
-          );
-        };
-        req.onerror = () => reject(req.error);
-      });
-    } catch {
-      return [];
-    }
+      assets.put(entry);
+      metadata.put(metadataFor(entry));
+    });
   }
 
   async has(url: string): Promise<boolean> {
-    const blob = await this.get(url);
-    return blob !== undefined;
+    return this.transaction('readonly', async (_, metadata) => {
+      const entry: CacheEntryMetadata | undefined = await requestResult(metadata.get(url));
+      return entry !== undefined && !this.lru.isExpired(entry);
+    });
   }
 
   async delete(url: string): Promise<boolean> {
-    try {
-      const db = await this.getDB();
-      const tx = db.transaction(STORE_NAME, 'readwrite');
-      const store = tx.objectStore(STORE_NAME);
-
-      await new Promise<void>((resolve, reject) => {
-        const req = store.delete(url);
-        req.onsuccess = () => resolve();
-        req.onerror = () => reject(req.error);
-      });
+    return this.transaction('readwrite', async (assets, metadata) => {
+      const exists = await requestResult(metadata.getKey(url));
+      if (exists === undefined) return false;
+      assets.delete(url);
+      metadata.delete(url);
       return true;
-    } catch {
-      return false;
-    }
+    });
   }
 
   async clear(): Promise<void> {
-    try {
-      const db = await this.getDB();
-      const tx = db.transaction(STORE_NAME, 'readwrite');
-      const store = tx.objectStore(STORE_NAME);
+    await this.transaction('readwrite', async (assets, metadata) => {
+      assets.clear();
+      metadata.clear();
+    });
+  }
 
-      await new Promise<void>((resolve, reject) => {
-        const req = store.clear();
-        req.onsuccess = () => resolve();
-        req.onerror = () => reject(req.error);
-      });
-    } catch (err) {
-      console.warn('[ShadowCast IndexedDB] Failed to clear store:', err);
-    }
+  private liveMetadata(): Promise<CacheEntryMetadata[]> {
+    return this.transaction('readonly', async (_, store) => {
+      const entries = await requestResult<CacheEntryMetadata[]>(store.getAll());
+      const now = Date.now();
+      return entries.filter((entry) => !this.lru.isExpired(entry, now));
+    });
   }
 
   async getSize(): Promise<number> {
-    const metadata = await this.getAllMetadata();
-    return metadata.reduce((acc, m) => acc + m.size, 0);
+    return (await this.liveMetadata()).reduce((total, entry) => total + entry.size, 0);
   }
 
   async getEntriesCount(): Promise<number> {
-    const metadata = await this.getAllMetadata();
-    return metadata.length;
+    return (await this.liveMetadata()).length;
+  }
+
+  close(): void {
+    const pending = this.dbPromise;
+    this.dbPromise = null;
+    void pending?.then((db) => db.close(), () => {});
   }
 }

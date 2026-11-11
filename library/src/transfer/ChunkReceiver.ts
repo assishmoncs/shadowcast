@@ -1,170 +1,216 @@
-/**
- * ShadowCast - Chunk Receiver and Reassembly with SHA-256 Validation
- */
-
-import { Chunk, ChunkBuffer, SwarmBitfieldMessage, SwarmPieceRequestMessage } from '../core/types.js';
+import {
+  DEFAULT_CHUNK_SIZE, MAX_SWARM_ASSET_BYTES, MAX_SWARM_CHUNKS,
+  SwarmBitfieldMessage, SwarmPieceRequestMessage,
+} from '../core/types.js';
 import { hashBuffer, hashBlob } from '../utils/hash.js';
 
 export interface ChunkReceiverCallbacks {
-  onAssetRequested?: (assetId: string, url: string, peerId: string) => void;
+  onAssetRequested?: (assetId: string, url: string, peerId: string, direct?: boolean) => void;
   onSwarmBitfieldReceived?: (bitfield: SwarmBitfieldMessage, peerId: string) => void;
   onSwarmPieceRequested?: (request: SwarmPieceRequestMessage, peerId: string) => void;
+  acceptChunk?: (assetId: string, peerId: string, total: number, hash?: string) => boolean;
   onAssetComplete: (assetId: string, blob: Blob) => void;
-  onChunkProgress?: (assetId: string, receivedChunks: number, totalChunks: number) => void;
+  onChunkReceived?: (assetId: string, chunkIndex: number, peerId: string) => void;
+  onChunkProgress?: (assetId: string, received: number, total: number, bytesReceived: number) => void;
   onIntegrityError?: (assetId: string, reason: string) => void;
 }
 
+interface TransferBuffer {
+  parts: Map<number, ArrayBuffer>;
+  total: number;
+  size: number;
+  mimeType: string;
+  hash?: string;
+  reassembling: boolean;
+}
+
+interface ChunkMeta {
+  assetId: string;
+  index: number;
+  chunkHash?: string;
+  transfer: TransferBuffer;
+}
+
+const digest = /^[a-f0-9]{64}$/;
+const indexInRange = (value: unknown, length: number): value is number =>
+  typeof value === 'number' && Number.isInteger(value) && value >= 0 && value < length;
+
 export class ChunkReceiver {
-  private chunkBuffers: Map<string, ChunkBuffer> = new Map();
-  private pendingChunkMeta: Map<string, { assetId: string; index: number; chunkHash?: string; assetHash?: string }> =
-    new Map();
+  private readonly buffers = new Map<string, TransferBuffer>();
+  private readonly pendingMetadata = new Map<string, (ChunkMeta | undefined)[]>();
+  private readonly verificationBytes = new Map<string, number>();
 
-  constructor(
-    private callbacks: ChunkReceiverCallbacks,
-    private verifyIntegrity: boolean = true
-  ) {}
+  constructor(private readonly callbacks: ChunkReceiverCallbacks, private readonly verifyIntegrity = true) {}
 
-  async handleMessage(data: ArrayBuffer | string, peerId: string): Promise<void> {
-    if (typeof data === 'string') {
-      let msg: Record<string, unknown>;
-      try {
-        msg = JSON.parse(data);
-      } catch {
-        return;
-      }
-
-      switch (msg.type) {
-        case 'asset-request': {
-          const { assetId, url } = msg as { assetId: string; url: string };
-          this.callbacks.onAssetRequested?.(assetId, url, peerId);
-          break;
-        }
-
-        case 'swarm-bitfield': {
-          const bitfield = msg as unknown as SwarmBitfieldMessage;
-          this.callbacks.onSwarmBitfieldReceived?.(bitfield, peerId);
-          break;
-        }
-
-        case 'swarm-piece-request': {
-          const pieceReq = msg as unknown as SwarmPieceRequestMessage;
-          this.callbacks.onSwarmPieceRequested?.(pieceReq, peerId);
-          break;
-        }
-
-        case 'chunk-meta': {
-          const { assetId, index, total, chunkHash, assetHash } = msg as unknown as Chunk & { type: string };
-          if (!this.chunkBuffers.has(assetId)) {
-            this.chunkBuffers.set(assetId, {
-              received: new Map(),
-              total,
-              mimeType: 'application/octet-stream',
-              assetHash,
-              chunkHashes: new Map(),
-            });
-          }
-
-          const buf = this.chunkBuffers.get(assetId)!;
-          if (assetHash && !buf.assetHash) {
-            buf.assetHash = assetHash;
-          }
-          if (chunkHash) {
-            buf.chunkHashes.set(index, chunkHash);
-          }
-
-          this.pendingChunkMeta.set(peerId, { assetId, index, chunkHash, assetHash });
-          break;
-        }
-
-        case 'chunk-done': {
-          const { assetId, mimeType, assetHash } = msg as { assetId: string; mimeType: string; assetHash?: string };
-          const buf = this.chunkBuffers.get(assetId);
-          if (buf) {
-            buf.mimeType = mimeType;
-            if (assetHash) {
-              buf.assetHash = assetHash;
-            }
-            await this.tryReassemble(assetId);
-          }
-          break;
-        }
-      }
+  async handleMessage(data: ArrayBuffer | ArrayBufferView | string, peerId: string): Promise<void> {
+    if (typeof data !== 'string') {
+      await this.storeBinaryChunk(data, peerId);
       return;
     }
+    if (data.length > DEFAULT_CHUNK_SIZE) return;
 
-    await this.storeBinaryChunk(data, peerId);
-  }
-
-  private async storeBinaryChunk(buffer: ArrayBuffer, peerId: string): Promise<void> {
-    const meta = this.pendingChunkMeta.get(peerId);
-    if (!meta) return;
-
-    const buf = this.chunkBuffers.get(meta.assetId);
-    if (!buf) return;
-
-    // Deduplication check: ignore if chunk index is already accepted
-    if (buf.received.has(meta.index)) {
-      this.pendingChunkMeta.delete(peerId);
+    let msg: Record<string, unknown>;
+    try {
+      msg = JSON.parse(data);
+    } catch {
       return;
     }
-
-    // SHA-256 chunk integrity verification
-    if (this.verifyIntegrity && meta.chunkHash) {
-      const calculatedHash = await hashBuffer(buffer);
-      if (calculatedHash !== meta.chunkHash) {
-        this.callbacks.onIntegrityError?.(
-          meta.assetId,
-          `Chunk ${meta.index} hash mismatch (expected ${meta.chunkHash}, got ${calculatedHash})`
-        );
-        this.pendingChunkMeta.delete(peerId);
-        return;
-      }
+    if (!msg) return;
+    const { assetId, url } = msg;
+    if (msg.type === 'chunk-meta') {
+      this.queueMetadata(peerId, this.parseMetadata(msg, peerId));
+      return;
     }
+    if (typeof assetId !== 'string' || !assetId || assetId.length > 128) return;
 
-    buf.received.set(meta.index, buffer);
-    this.pendingChunkMeta.delete(peerId);
-
-    this.callbacks.onChunkProgress?.(meta.assetId, buf.received.size, buf.total);
-    await this.tryReassemble(meta.assetId);
+    switch (msg.type) {
+      case 'asset-request':
+        if (typeof url === 'string' && url) this.callbacks.onAssetRequested?.(assetId, url, peerId, msg.direct === true);
+        break;
+      case 'swarm-bitfield':
+        if (typeof url === 'string' && indexInRange(msg.totalChunks, MAX_SWARM_CHUNKS + 1) &&
+            this.validLayout(msg) &&
+            Array.isArray(msg.availableChunks) && msg.availableChunks.length <= MAX_SWARM_CHUNKS &&
+            msg.availableChunks.every((index) => indexInRange(index, msg.totalChunks as number)) &&
+            typeof msg.assetHash === 'string' && digest.test(msg.assetHash) &&
+            typeof msg.mimeType === 'string') {
+          this.callbacks.onSwarmBitfieldReceived?.(msg as unknown as SwarmBitfieldMessage, peerId);
+        }
+        break;
+      case 'swarm-piece-request':
+        if ((url === undefined || typeof url === 'string') && Array.isArray(msg.indices) &&
+            msg.indices.length <= MAX_SWARM_CHUNKS && msg.indices.every((index) => indexInRange(index, MAX_SWARM_CHUNKS))) {
+          this.callbacks.onSwarmPieceRequested?.(msg as unknown as SwarmPieceRequestMessage, peerId);
+        }
+        break;
+      case 'chunk-done':
+        if (msg.total === 0 && !this.buffers.has(assetId)) {
+          const transfer = this.getTransfer(assetId, peerId, 0, msg.assetHash, msg.mimeType);
+          if (transfer) await this.tryReassemble(assetId, transfer);
+        }
+        break;
+    }
   }
 
-  private async tryReassemble(assetId: string): Promise<void> {
-    const buf = this.chunkBuffers.get(assetId);
-    if (!buf || buf.received.size < buf.total) return;
+  private validLayout({ sizeBytes, chunkSize, totalChunks }: Record<string, unknown>): boolean {
+    if (sizeBytes === undefined && chunkSize === undefined) return true;
+    return indexInRange(sizeBytes, MAX_SWARM_ASSET_BYTES + 1) &&
+      indexInRange(chunkSize, DEFAULT_CHUNK_SIZE + 1) && chunkSize > 0 &&
+      Math.ceil(sizeBytes / chunkSize) === totalChunks;
+  }
 
-    const parts: ArrayBuffer[] = [];
-    for (let i = 0; i < buf.total; i++) {
-      const chunk = buf.received.get(i);
-      if (!chunk) return;
-      parts.push(chunk);
-    }
+  private parseMetadata(msg: Record<string, unknown>, peerId: string): ChunkMeta | undefined {
+    const { assetId, index, total, assetHash, chunkHash, mimeType } = msg;
+    if (typeof assetId !== 'string' || !assetId || assetId.length > 128 ||
+        !indexInRange(total, MAX_SWARM_CHUNKS + 1) || !indexInRange(index, total)) return;
+    const hash = typeof chunkHash === 'string' && digest.test(chunkHash) ? chunkHash : undefined;
+    if (this.verifyIntegrity && !hash) return;
+    const transfer = this.getTransfer(assetId, peerId, total, assetHash, mimeType);
+    if (transfer) return { assetId, index, chunkHash: hash, transfer };
+  }
 
-    const blob = new Blob(parts, { type: buf.mimeType });
+  private getTransfer(assetId: string, peerId: string, total: number, assetHash: unknown, mimeType: unknown) {
+    const hash = typeof assetHash === 'string' && digest.test(assetHash) ? assetHash : undefined;
+    if (this.verifyIntegrity && !hash) return;
+    if (this.callbacks.acceptChunk && !this.callbacks.acceptChunk(assetId, peerId, total, hash)) return;
+    const existing = this.buffers.get(assetId);
+    if (existing) return existing.total === total && existing.hash === hash ? existing : undefined;
+    if (this.buffers.size >= 8) return;
+    const transfer: TransferBuffer = {
+      total, hash, parts: new Map(), size: 0, reassembling: false,
+      mimeType: typeof mimeType === 'string' && mimeType.length <= 128 ? mimeType : 'application/octet-stream',
+    };
+    this.buffers.set(assetId, transfer);
+    return transfer;
+  }
 
-    // End-to-end full asset integrity verification
-    if (this.verifyIntegrity && buf.assetHash) {
-      const fullHash = await hashBlob(blob);
-      if (fullHash !== buf.assetHash) {
-        this.callbacks.onIntegrityError?.(
-          assetId,
-          `Full asset SHA-256 mismatch (expected ${buf.assetHash}, got ${fullHash})`
-        );
+  private queueMetadata(peerId: string, metadata: ChunkMeta | undefined): void {
+    const queue = this.pendingMetadata.get(peerId) ?? [];
+    // Keep a placeholder for rejected metadata so it still consumes its associated binary frame.
+    if (queue.length < 32) queue.push(metadata);
+    else queue.fill(undefined);
+    this.pendingMetadata.set(peerId, queue);
+  }
+
+  private async storeBinaryChunk(data: ArrayBuffer | ArrayBufferView, peerId: string): Promise<void> {
+    const queue = this.pendingMetadata.get(peerId);
+    const meta = queue?.shift();
+    if (queue?.length === 0) this.pendingMetadata.delete(peerId);
+    if (!meta || data.byteLength === 0 || data.byteLength > DEFAULT_CHUNK_SIZE) return;
+
+    const { assetId, index, transfer } = meta;
+    if (this.buffers.get(assetId) !== transfer || transfer.parts.has(index)) return;
+    const pending = this.verificationBytes.get(peerId) ?? 0;
+    if (pending + data.byteLength > 8 * 1024 * 1024) return;
+    const bytes = ArrayBuffer.isView(data)
+      ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength).slice().buffer
+      : data;
+    this.verificationBytes.set(peerId, pending + bytes.byteLength);
+    try {
+      const matches = !this.verifyIntegrity || await hashBuffer(bytes) === meta.chunkHash;
+      if (this.buffers.get(assetId) !== transfer || transfer.parts.has(index)) return;
+      if (this.callbacks.acceptChunk && !this.callbacks.acceptChunk(assetId, peerId, transfer.total, transfer.hash)) return;
+      if (!matches) {
+        this.callbacks.onIntegrityError?.(assetId, `Chunk ${index} SHA-256 mismatch`);
         return;
       }
-    }
+      if (transfer.size + bytes.byteLength > MAX_SWARM_ASSET_BYTES) {
+        this.clearAsset(assetId);
+        this.callbacks.onIntegrityError?.(assetId, 'Swarm asset exceeds the size limit');
+        return;
+      }
 
-    this.chunkBuffers.delete(assetId);
-    this.callbacks.onAssetComplete(assetId, blob);
+      transfer.size += bytes.byteLength;
+      transfer.parts.set(index, bytes);
+      this.callbacks.onChunkReceived?.(assetId, index, peerId);
+      this.callbacks.onChunkProgress?.(assetId, transfer.parts.size, transfer.total, transfer.size);
+      await this.tryReassemble(assetId, transfer);
+    } finally {
+      const remaining = this.verificationBytes.get(peerId)! - bytes.byteLength;
+      if (remaining > 0) this.verificationBytes.set(peerId, remaining);
+      else this.verificationBytes.delete(peerId);
+    }
+  }
+
+  private async tryReassemble(assetId: string, transfer: TransferBuffer): Promise<void> {
+    if (transfer.reassembling || transfer.parts.size !== transfer.total || this.buffers.get(assetId) !== transfer) return;
+    transfer.reassembling = true;
+    const parts = Array.from({ length: transfer.total }, (_, i) => transfer.parts.get(i)!);
+    const blob = new Blob(parts, { type: transfer.mimeType });
+    try {
+      const matches = !this.verifyIntegrity || await hashBlob(blob) === transfer.hash;
+      if (this.buffers.get(assetId) !== transfer) return;
+      this.clearAsset(assetId);
+      if (matches) this.callbacks.onAssetComplete(assetId, blob);
+      else this.callbacks.onIntegrityError?.(assetId, 'Full asset SHA-256 mismatch');
+    } finally {
+      transfer.reassembling = false;
+    }
   }
 
   getReceivedChunkIndices(assetId: string): Set<number> {
-    const buf = this.chunkBuffers.get(assetId);
-    if (!buf) return new Set();
-    return new Set(buf.received.keys());
+    return new Set(this.buffers.get(assetId)?.parts.keys());
+  }
+
+  getExpectedTotalChunks(assetId: string): number | undefined {
+    return this.buffers.get(assetId)?.total;
+  }
+
+  clearAsset(assetId: string): void {
+    this.buffers.delete(assetId);
+    for (const queue of this.pendingMetadata.values()) {
+      for (let i = 0; i < queue.length; i++) {
+        if (queue[i]?.assetId === assetId) queue[i] = undefined;
+      }
+    }
+  }
+
+  clearPeer(peerId: string): void {
+    this.pendingMetadata.delete(peerId);
   }
 
   clear(): void {
-    this.chunkBuffers.clear();
-    this.pendingChunkMeta.clear();
+    this.buffers.clear();
+    this.pendingMetadata.clear();
   }
 }

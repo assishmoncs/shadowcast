@@ -8,10 +8,11 @@
     "demo"
   ],
   "scripts": {
-    "build": "npm --prefix library run build && npm --prefix demo run build",
-    "test": "npm --prefix library run test",
-    "dev:library": "npm --prefix library run dev",
-    "dev:demo": "npm --prefix demo run dev"
+    "build": "npm run build -w library && npm run build -w demo",
+    "test": "npm run test -w library",
+    "test:e2e": "npm run build && playwright test",
+    "dev:library": "npm run dev -w library",
+    "dev:demo": "npm run build -w library && npm run dev -w demo"
   },
   "keywords": [
     "p2p",
@@ -23,5 +24,11 @@
     "service-worker"
   ],
   "author": "ShadowCast Contributors",
-  "license": "MIT"
+  "license": "MIT",
+  "devDependencies": {
+    "@playwright/test": "1.65.0"
+  },
+  "engines": {
+    "node": ">=24"
+  }
 }

@@ -20,9 +20,18 @@ export class PiecePicker {
   private activeAssignments: Map<string, Map<number, { peerId: string; assignedAt: number }>> =
     new Map();
 
-  registerPeerChunks(assetId: string, peerId: string, chunkIndices: number[]): void {
+  // assetId -> totalChunks known for the asset
+  private assetTotalChunks: Map<string, number> = new Map();
+
+  constructor(private readonly assignmentTimeoutMs: number = 6000) {}
+
+  registerPeerChunks(assetId: string, peerId: string, chunkIndices: number[], totalChunks?: number): void {
     if (!this.swarmAvailability.has(assetId)) {
       this.swarmAvailability.set(assetId, new Map());
+    }
+
+    if (typeof totalChunks === 'number' && totalChunks > 0) {
+      this.assetTotalChunks.set(assetId, totalChunks);
     }
 
     const peerMap = this.swarmAvailability.get(assetId)!;
@@ -33,7 +42,7 @@ export class PiecePicker {
     const unassignedPerAsset: Map<string, number[]> = new Map();
 
     // Clean up availability
-    for (const [assetId, peerMap] of this.swarmAvailability.entries()) {
+    for (const [, peerMap] of this.swarmAvailability.entries()) {
       peerMap.delete(peerId);
     }
 
@@ -60,12 +69,15 @@ export class PiecePicker {
     alreadyReceived: Set<number>,
     availablePeers: string[]
   ): PieceAssignment[] {
-    const peerMap = this.swarmAvailability.get(assetId);
-    const validPeers = availablePeers.filter(
-      (pid) => !peerMap || peerMap.has(pid)
-    );
+    if (totalChunks <= 0 || availablePeers.length === 0) {
+      return [];
+    }
 
-    if (validPeers.length === 0) {
+    this.assetTotalChunks.set(assetId, totalChunks);
+    const peerMap = this.swarmAvailability.get(assetId);
+    const validPeers = new Set(availablePeers.filter((pid) => !peerMap || peerMap.has(pid)));
+
+    if (validPeers.size === 0) {
       return [];
     }
 
@@ -84,8 +96,14 @@ export class PiecePicker {
       }
 
       const current = assignmentsMap.get(i);
-      // If unassigned or timed out after 6 seconds, schedule it
-      if (!current || now - current.assignedAt > 6000) {
+      // If unassigned, assigned to a disconnected peer, or timed out, schedule it
+      if (
+        !current ||
+        !validPeers.has(current.peerId) ||
+        (peerMap && !peerMap.get(current.peerId)?.has(i)) ||
+        now - current.assignedAt > this.assignmentTimeoutMs
+      ) {
+        assignmentsMap.delete(i);
         neededChunks.push(i);
       }
     }
@@ -94,17 +112,38 @@ export class PiecePicker {
       return [];
     }
 
-    // Partition needed chunks evenly across valid peers
+    // Track current load per peer to distribute pieces evenly across capable peers
     const result: Map<string, number[]> = new Map();
+    const peerLoad: Map<string, number> = new Map();
     for (const pid of validPeers) {
       result.set(pid, []);
+      peerLoad.set(pid, 0);
+    }
+
+    for (const [, info] of assignmentsMap.entries()) {
+      if (peerLoad.has(info.peerId)) {
+        peerLoad.set(info.peerId, peerLoad.get(info.peerId)! + 1);
+      }
     }
 
     for (let i = 0; i < neededChunks.length; i++) {
       const chunkIdx = neededChunks[i];
-      // Pick next peer round-robin
-      const chosenPeer = validPeers[i % validPeers.length];
+
+      // Select capable peer with minimum assigned load
+      let chosenPeer: string | undefined;
+      let minLoad = Infinity;
+      for (const candidate of validPeers) {
+        if (peerMap && !peerMap.get(candidate)?.has(chunkIdx)) continue;
+        const load = peerLoad.get(candidate)!;
+        if (load < minLoad) {
+          minLoad = load;
+          chosenPeer = candidate;
+        }
+      }
+      if (chosenPeer === undefined) continue;
+
       result.get(chosenPeer)!.push(chunkIdx);
+      peerLoad.set(chosenPeer, minLoad + 1);
       assignmentsMap.set(chunkIdx, { peerId: chosenPeer, assignedAt: now });
     }
 
@@ -118,6 +157,10 @@ export class PiecePicker {
     return assignments;
   }
 
+  getTotalChunks(assetId: string): number | undefined {
+    return this.assetTotalChunks.get(assetId);
+  }
+
   markChunkCompleted(assetId: string, chunkIndex: number): void {
     const assignmentsMap = this.activeAssignments.get(assetId);
     if (assignmentsMap) {
@@ -128,10 +171,12 @@ export class PiecePicker {
   clearAsset(assetId: string): void {
     this.swarmAvailability.delete(assetId);
     this.activeAssignments.delete(assetId);
+    this.assetTotalChunks.delete(assetId);
   }
 
   clear(): void {
     this.swarmAvailability.clear();
     this.activeAssignments.clear();
+    this.assetTotalChunks.clear();
   }
 }

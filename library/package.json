@@ -8,19 +8,22 @@
   "types": "dist/index.d.ts",
   "exports": {
     ".": {
-      "import": "./dist/index.js",
-      "types": "./dist/index.d.ts"
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
     },
     "./sw": "./dist/interception/sw.js"
   },
   "files": [
-    "dist"
+    "dist",
+    "!dist/__tests__"
   ],
-  "sideEffects": false,
+  "sideEffects": [
+    "./dist/interception/sw.js"
+  ],
   "scripts": {
-    "build": "tsc",
-    "dev": "tsc --watch",
-    "test": "tsc && node --test dist/__tests__/*.test.js"
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsc -p tsconfig.json --watch",
+    "test": "tsc -p tsconfig.test.json && node --test .test-dist/__tests__/*.test.js"
   },
   "keywords": [
     "p2p",
@@ -34,9 +37,9 @@
   ],
   "author": "ShadowCast Contributors",
   "license": "MIT",
-  "dependencies": {},
   "devDependencies": {
     "@types/node": "^20.0.0",
+    "fake-indexeddb": "6.2.8",
     "typescript": "^5.5.0"
   }
 }
