@@ -10,45 +10,82 @@ import {
 } from './types.js';
 
 export class LRUPolicy {
+  public readonly maxSizeBytes: number;
+  public readonly maxEntries: number;
+  public readonly ttlMs: number;
+
   constructor(
-    public readonly maxSizeBytes: number = DEFAULT_MAX_CACHE_SIZE,
-    public readonly maxEntries: number = DEFAULT_MAX_ENTRIES,
-    public readonly ttlMs: number = DEFAULT_CACHE_TTL
-  ) {}
+    maxSizeBytes: number = DEFAULT_MAX_CACHE_SIZE,
+    maxEntries: number = DEFAULT_MAX_ENTRIES,
+    ttlMs: number = DEFAULT_CACHE_TTL
+  ) {
+    this.maxSizeBytes = Math.max(0, maxSizeBytes);
+    this.maxEntries = Math.max(0, maxEntries);
+    this.ttlMs = Math.max(0, ttlMs);
+  }
+
+  /**
+   * Checks whether a single entry has expired according to the configured TTL.
+   */
+  isExpired(entry: Pick<CacheEntryMetadata, 'storedAt'>, now: number = Date.now()): boolean {
+    return this.ttlMs > 0 && now - entry.storedAt > this.ttlMs;
+  }
 
   /**
    * Identifies candidate URLs to evict based on TTL expiry and LRU order.
    */
   findEvictionCandidates(
     entries: CacheEntryMetadata[],
-    incomingSizeBytes: number = 0
+    incomingSizeBytes: number = 0,
+    incomingUrl?: string
   ): string[] {
     const now = Date.now();
-    const toEvict: string[] = [];
-    let currentTotalSize = entries.reduce((acc, e) => acc + e.size, 0);
-    let currentCount = entries.length;
+    const evictedSet = new Set<string>();
+    let currentTotalSize = 0;
+    let currentCount = 0;
+
+    for (const entry of entries) {
+      if (incomingUrl && entry.url === incomingUrl) {
+        // Updating an existing entry in-place: do not count its old size/slot against the incoming replacement
+        continue;
+      }
+      currentTotalSize += entry.size;
+      currentCount++;
+    }
 
     // 1. Evict expired entries first
     for (const entry of entries) {
-      if (this.ttlMs > 0 && now - entry.storedAt > this.ttlMs) {
-        toEvict.push(entry.url);
-        currentTotalSize -= entry.size;
-        currentCount--;
+      if (this.isExpired(entry, now)) {
+        evictedSet.add(entry.url);
+        if (!incomingUrl || entry.url !== incomingUrl) {
+          currentTotalSize -= entry.size;
+          currentCount--;
+        }
       }
     }
 
-    // Filter remaining active entries sorted by least recently accessed
+    // If incoming entry is requested and maxEntries === 0 or incoming alone exceeds maxSizeBytes,
+    // still return expired entries without needlessly wiping valid entries if incoming cannot fit.
+    if (incomingSizeBytes > 0 && (this.maxEntries === 0 || incomingSizeBytes > this.maxSizeBytes)) {
+      return Array.from(evictedSet);
+    }
+
+    // Filter remaining active entries sorted by least recently accessed (with storedAt tie-breaker)
     const remaining = entries
-      .filter((e) => !toEvict.includes(e.url))
-      .sort((a, b) => a.lastAccessedAt - b.lastAccessedAt);
+      .filter((e) => !evictedSet.has(e.url) && (!incomingUrl || e.url !== incomingUrl))
+      .sort((a, b) => a.lastAccessedAt - b.lastAccessedAt || a.storedAt - b.storedAt);
+
+    const addingNewEntry = incomingSizeBytes > 0 || incomingUrl !== undefined;
 
     // 2. Evict least-recently-used until within size and entry bounds
     for (const entry of remaining) {
       const willExceedSize = currentTotalSize + incomingSizeBytes > this.maxSizeBytes;
-      const willExceedCount = currentCount + 1 > this.maxEntries;
+      const willExceedCount = addingNewEntry
+        ? currentCount + 1 > this.maxEntries
+        : currentCount > this.maxEntries;
 
       if (willExceedSize || willExceedCount) {
-        toEvict.push(entry.url);
+        evictedSet.add(entry.url);
         currentTotalSize -= entry.size;
         currentCount--;
       } else {
@@ -56,6 +93,6 @@ export class LRUPolicy {
       }
     }
 
-    return toEvict;
+    return Array.from(evictedSet);
   }
 }

@@ -29,9 +29,15 @@ export { ChunkSender } from './transfer/ChunkSender.js';
 export { ChunkReceiver } from './transfer/ChunkReceiver.js';
 export { PiecePicker } from './transfer/PiecePicker.js';
 export { ServiceWorkerManager } from './interception/ServiceWorkerManager.js';
-export type { ServiceWorkerOptions, SWAssetRequestMessage, SWAssetResponseMessage } from './interception/types.js';
-export { hashBuffer, hashBlob, hashString } from './utils/hash.js';
-export { getAssetId } from './utils/url.js';
+export type {
+  ServiceWorkerOptions,
+  SWAssetRequestMessage,
+  SWAssetResponseMessage,
+  SWConfigMessage,
+} from './interception/types.js';
+export { DEFAULT_SW_INCLUDE_PATTERNS } from './interception/types.js';
+export { hashBuffer, hashBlob, hashString, sha256Fallback } from './utils/hash.js';
+export { getAssetId, normalizeAssetUrl, generateUUID } from './utils/url.js';
 export type {
   Chunk,
   ChunkBuffer,

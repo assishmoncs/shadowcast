@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -24,6 +25,7 @@ type Client struct {
 	room        string
 	rateLimiter *RateLimiter
 	mu          sync.Mutex
+	closed      atomic.Bool
 }
 
 // ---------- Global state ----------
@@ -36,14 +38,18 @@ var (
 	upgrader    websocket.Upgrader
 )
 
-func main() {
-	appConfig = LoadConfig()
+func initServerState(cfg *Config) http.Handler {
+	appConfig = cfg
 
-	// Initialize structured logger
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-	slog.SetDefault(logger)
+	globalMu.Lock()
+	rooms = make(map[string]map[*Client]bool)
+	clientsById = make(map[string]*Client)
+	globalMu.Unlock()
 
-	// Configure WebSocket upgrader with origin checking
+	metrics = &ServerMetrics{
+		startTime: time.Now(),
+	}
+
 	upgrader = websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool {
 			if len(appConfig.AllowedOrigins) == 0 {
@@ -51,7 +57,7 @@ func main() {
 			}
 			origin := r.Header.Get("Origin")
 			for _, allowed := range appConfig.AllowedOrigins {
-				if allowed == "*" || allowed == origin {
+				if allowed == "*" || strings.EqualFold(allowed, origin) {
 					return true
 				}
 			}
@@ -65,13 +71,23 @@ func main() {
 	mux.HandleFunc("/ready", handleReady)
 	mux.HandleFunc("/metrics", handleMetrics)
 	mux.HandleFunc("/ws", handleWebSocket)
+	return mux
+}
+
+func main() {
+	cfg := LoadConfig()
+
+	// Initialize structured logger
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	slog.SetDefault(logger)
+
+	handler := initServerState(cfg)
 
 	server := &http.Server{
-		Addr:         appConfig.Port,
-		Handler:      mux,
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 15 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		Addr:              appConfig.Port,
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	// Setup graceful shutdown
@@ -121,8 +137,14 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 	defer conn.Close()
 
-	// Enforce message read limit
+	// Enforce message read limit and pong deadlines
 	conn.SetReadLimit(appConfig.ReadLimitBytes)
+	if appConfig.PongWait > 0 {
+		_ = conn.SetReadDeadline(time.Now().Add(appConfig.PongWait))
+		conn.SetPongHandler(func(string) error {
+			return conn.SetReadDeadline(time.Now().Add(appConfig.PongWait))
+		})
+	}
 
 	client := &Client{
 		id:          uuid.New().String(),
@@ -145,17 +167,46 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		"id":   client.id,
 	})
 
+	done := make(chan struct{})
 	defer func() {
-		globalMu.Lock()
-		delete(clientsById, client.id)
-		globalMu.Unlock()
+		close(done)
 		handleDisconnect(client)
 	}()
+
+	// Periodic ping heartbeat to detect dead TCP connections
+	if appConfig.PingInterval > 0 {
+		go func() {
+			ticker := time.NewTicker(appConfig.PingInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-done:
+					return
+				case <-ticker.C:
+					if client.closed.Load() {
+						return
+					}
+					client.mu.Lock()
+					_ = client.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+					err := client.conn.WriteMessage(websocket.PingMessage, nil)
+					client.mu.Unlock()
+					if err != nil {
+						handleDisconnect(client)
+						return
+					}
+				}
+			}
+		}()
+	}
 
 	for {
 		_, message, err := conn.ReadMessage()
 		if err != nil {
 			break
+		}
+
+		if appConfig.PongWait > 0 {
+			_ = conn.SetReadDeadline(time.Now().Add(appConfig.PongWait))
 		}
 
 		atomic.AddUint64(&metrics.totalMessagesIn, 1)
@@ -173,6 +224,10 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 		var msg map[string]interface{}
 		if err := json.Unmarshal(message, &msg); err != nil {
+			sendJSON(client, map[string]string{
+				"type":  "error",
+				"error": "Invalid JSON message format",
+			})
 			continue
 		}
 
@@ -181,8 +236,26 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		switch msgType {
 		case "join":
 			room, _ := msg["room"].(string)
+			room = strings.TrimSpace(room)
 			if room == "" {
+				sendJSON(client, map[string]string{
+					"type":  "error",
+					"error": "Room name is required",
+				})
 				continue
+			}
+
+			// Synchronize client ID if provided in the join handshake
+			requestedID, _ := msg["from"].(string)
+			requestedID = strings.TrimSpace(requestedID)
+			if requestedID != "" && requestedID != client.id {
+				globalMu.Lock()
+				if existing, exists := clientsById[requestedID]; !exists || existing == client {
+					delete(clientsById, client.id)
+					client.id = requestedID
+					clientsById[client.id] = client
+				}
+				globalMu.Unlock()
 			}
 
 			// Validate room capacity limits
@@ -196,7 +269,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 
-			if rooms[room] != nil && len(rooms[room]) >= appConfig.MaxClientsPerRoom {
+			if rooms[room] != nil && !rooms[room][client] && len(rooms[room]) >= appConfig.MaxClientsPerRoom {
 				globalMu.Unlock()
 				sendJSON(client, map[string]string{
 					"type":  "error",
@@ -206,21 +279,21 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			}
 			globalMu.Unlock()
 
-			client.room = room
 			joinRoom(client, room)
 
 		case "offer", "answer", "ice-candidate":
 			target, _ := msg["target"].(string)
-			if target == "" {
-				broadcastToRoom(client.room, message, client)
-				continue
-			}
-
 			msg["from"] = client.id
 			enriched, err := json.Marshal(msg)
 			if err != nil {
 				continue
 			}
+
+			if target == "" {
+				broadcastToRoom(client.room, enriched, client)
+				continue
+			}
+
 			sendToTarget(target, enriched)
 		}
 	}
@@ -228,20 +301,65 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 // ---------- Room Management ----------
 
+func leaveRoomLocked(client *Client) ([]*Client, string) {
+	oldRoom := client.room
+	if oldRoom == "" || rooms[oldRoom] == nil {
+		client.room = ""
+		return nil, ""
+	}
+
+	delete(rooms[oldRoom], client)
+	peersToNotify := make([]*Client, 0, len(rooms[oldRoom]))
+	for c := range rooms[oldRoom] {
+		peersToNotify = append(peersToNotify, c)
+	}
+
+	if len(rooms[oldRoom]) == 0 {
+		delete(rooms, oldRoom)
+	}
+
+	client.room = ""
+	return peersToNotify, oldRoom
+}
+
 func joinRoom(client *Client, room string) {
 	globalMu.Lock()
+
+	var oldPeersToNotify []*Client
+	var oldRoom string
+	alreadyInSameRoom := client.room == room && rooms[room] != nil && rooms[room][client]
+
+	if client.room != "" && client.room != room {
+		oldPeersToNotify, oldRoom = leaveRoomLocked(client)
+	}
 
 	if rooms[room] == nil {
 		rooms[room] = make(map[*Client]bool)
 	}
 
 	existingPeers := make([]string, 0, len(rooms[room]))
+	peersInNewRoom := make([]*Client, 0, len(rooms[room]))
 	for c := range rooms[room] {
-		existingPeers = append(existingPeers, c.id)
+		if c != client {
+			existingPeers = append(existingPeers, c.id)
+			peersInNewRoom = append(peersInNewRoom, c)
+		}
 	}
 
 	rooms[room][client] = true
+	client.room = room
 	globalMu.Unlock()
+
+	// Notify peers in previous room if client switched rooms
+	if len(oldPeersToNotify) > 0 && oldRoom != "" {
+		leaveMsg, _ := json.Marshal(map[string]string{
+			"type": "peer-left",
+			"id":   client.id,
+		})
+		for _, c := range oldPeersToNotify {
+			rawWrite(c, leaveMsg)
+		}
+	}
 
 	slog.Info("Client joined room", "client_id", client.id, "room", room, "peers_count", len(existingPeers))
 
@@ -250,18 +368,15 @@ func joinRoom(client *Client, room string) {
 		"peers": existingPeers,
 	})
 
-	peerJoinedMsg, _ := json.Marshal(map[string]string{
-		"type": "peer-joined",
-		"id":   client.id,
-	})
-
-	globalMu.RLock()
-	for c := range rooms[room] {
-		if c != client {
+	if !alreadyInSameRoom {
+		peerJoinedMsg, _ := json.Marshal(map[string]string{
+			"type": "peer-joined",
+			"id":   client.id,
+		})
+		for _, c := range peersInNewRoom {
 			writeMessage(c, peerJoinedMsg)
 		}
 	}
-	globalMu.RUnlock()
 }
 
 func sendToTarget(targetID string, message []byte) {
@@ -276,18 +391,31 @@ func sendToTarget(targetID string, message []byte) {
 }
 
 func broadcastToRoom(room string, message []byte, sender *Client) {
-	globalMu.RLock()
-	defer globalMu.RUnlock()
+	if room == "" {
+		return
+	}
 
+	globalMu.RLock()
+	recipients := make([]*Client, 0, len(rooms[room]))
 	for c := range rooms[room] {
 		if c != sender {
-			writeMessage(c, message)
+			recipients = append(recipients, c)
 		}
+	}
+	globalMu.RUnlock()
+
+	for _, c := range recipients {
+		writeMessage(c, message)
 	}
 }
 
 func writeMessage(c *Client, message []byte) {
+	if c.closed.Load() {
+		return
+	}
+
 	c.mu.Lock()
+	_ = c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 	err := c.conn.WriteMessage(websocket.TextMessage, message)
 	c.mu.Unlock()
 
@@ -300,7 +428,12 @@ func writeMessage(c *Client, message []byte) {
 }
 
 func rawWrite(c *Client, message []byte) {
+	if c.closed.Load() {
+		return
+	}
+
 	c.mu.Lock()
+	_ = c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 	err := c.conn.WriteMessage(websocket.TextMessage, message)
 	c.mu.Unlock()
 
@@ -318,35 +451,27 @@ func sendJSON(c *Client, v interface{}) {
 }
 
 func handleDisconnect(client *Client) {
-	globalMu.Lock()
-
-	if client.room == "" {
-		globalMu.Unlock()
+	if !client.closed.CompareAndSwap(false, true) {
 		return
 	}
 
-	room := client.room
-	delete(rooms[room], client)
-
-	peersToNotify := make([]*Client, 0, len(rooms[room]))
-	for c := range rooms[room] {
-		peersToNotify = append(peersToNotify, c)
+	globalMu.Lock()
+	if existing, ok := clientsById[client.id]; ok && existing == client {
+		delete(clientsById, client.id)
 	}
-
-	if len(rooms[room]) == 0 {
-		delete(rooms, room)
-	}
-
-	client.room = ""
+	peersToNotify, room := leaveRoomLocked(client)
 	globalMu.Unlock()
 
-	slog.Info("Client disconnected", "client_id", client.id, "room", room)
+	_ = client.conn.Close()
 
-	leaveMsg, _ := json.Marshal(map[string]string{
-		"type": "peer-left",
-		"id":   client.id,
-	})
-	for _, c := range peersToNotify {
-		rawWrite(c, leaveMsg)
+	if room != "" {
+		slog.Info("Client disconnected", "client_id", client.id, "room", room)
+		leaveMsg, _ := json.Marshal(map[string]string{
+			"type": "peer-left",
+			"id":   client.id,
+		})
+		for _, c := range peersToNotify {
+			rawWrite(c, leaveMsg)
+		}
 	}
 }

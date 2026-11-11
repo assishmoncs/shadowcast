@@ -2,7 +2,7 @@
  * ShadowCast - Service Worker Manager (Main Window Thread)
  */
 
-import { ServiceWorkerOptions, SWAssetRequestMessage } from './types.js';
+import { ServiceWorkerOptions, SWAssetRequestMessage, SWConfigMessage } from './types.js';
 
 export interface ServiceWorkerManagerCallbacks {
   onRequestAssetBlob: (url: string) => Promise<Blob>;
@@ -29,10 +29,34 @@ export class ServiceWorkerManager {
       });
 
       this.setupMessageListener();
+      this.postConfigToWorker(options);
       return this.registration;
     } catch (err) {
       console.error('[ShadowCast SW] Failed to register Service Worker:', err);
       return null;
+    }
+  }
+
+  private postConfigToWorker(options: ServiceWorkerOptions): void {
+    if (!this.registration) return;
+    const worker =
+      this.registration.active || this.registration.waiting || this.registration.installing;
+    if (!worker) return;
+
+    const serializePattern = (p: string | RegExp): string =>
+      p instanceof RegExp ? p.source : String(p);
+
+    const configMsg: SWConfigMessage = {
+      type: 'SHADOWCAST_SW_CONFIG',
+      includePatterns: options.includePatterns?.map(serializePattern),
+      excludePatterns: options.excludePatterns?.map(serializePattern),
+      timeoutMs: options.timeoutMs,
+    };
+
+    try {
+      worker.postMessage(configMsg);
+    } catch {
+      // Ignore postMessage errors if worker is not ready
     }
   }
 
@@ -47,7 +71,7 @@ export class ServiceWorkerManager {
         return;
       }
 
-      const port = event.ports[0];
+      const port = event.ports?.[0];
       if (!port) return;
 
       try {
@@ -57,7 +81,7 @@ export class ServiceWorkerManager {
           id: data.id,
           success: true,
           blob,
-          mimeType: blob.type,
+          mimeType: blob.type || 'application/octet-stream',
         });
       } catch (err: any) {
         port.postMessage({
@@ -66,6 +90,12 @@ export class ServiceWorkerManager {
           success: false,
           error: err?.message || String(err),
         });
+      } finally {
+        try {
+          port.close?.();
+        } catch {
+          // Ignore port close error
+        }
       }
     };
 
@@ -79,9 +109,13 @@ export class ServiceWorkerManager {
     }
 
     if (this.registration) {
-      const result = await this.registration.unregister();
+      const reg = this.registration;
       this.registration = null;
-      return result;
+      try {
+        return await reg.unregister();
+      } catch {
+        return false;
+      }
     }
 
     return false;

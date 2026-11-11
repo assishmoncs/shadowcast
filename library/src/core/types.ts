@@ -8,6 +8,7 @@ export interface Chunk {
   index: number;
   total: number;
   assetId: string;
+  mimeType?: string;
   chunkHash?: string;
   assetHash?: string;
   data?: string;
@@ -24,7 +25,8 @@ export interface ChunkBuffer {
 export interface PendingAsset {
   url: string;
   startTime: number;
-  resolve: (url: string) => void;
+  timeoutId?: ReturnType<typeof setTimeout>;
+  resolve: (blob: Blob) => void;
   reject?: (error: Error) => void;
 }
 
@@ -48,6 +50,7 @@ export interface SignalingMessagePayload {
   peers?: string[];
   sdp?: RTCSessionDescriptionInit;
   candidate?: RTCIceCandidateInit;
+  error?: string;
   [key: string]: unknown;
 }
 
@@ -64,6 +67,7 @@ export interface SwarmBitfieldMessage {
 export interface SwarmPieceRequestMessage {
   type: 'swarm-piece-request';
   assetId: string;
+  url?: string;
   indices: number[];
 }
 

@@ -14,10 +14,11 @@ export interface MeshManagerCallbacks {
 
 export class MeshManager {
   private peers: Map<string, PeerConnection> = new Map();
-  private peerWaiters: Set<() => void> = new Set();
+  private activeOpenPeers: Set<string> = new Set();
+  private peerWaiters: Set<(ready: boolean) => void> = new Set();
 
   constructor(
-    public readonly localPeerId: string,
+    public localPeerId: string,
     private signalingClient: SignalingClient,
     private iceServers: RTCIceServer[] = DEFAULT_ICE_SERVERS,
     private callbacks: MeshManagerCallbacks
@@ -28,45 +29,59 @@ export class MeshManager {
   }
 
   async handleSignalingMessage(msg: SignalingMessagePayload): Promise<void> {
-    switch (msg.type) {
-      case 'room-peers': {
-        const peers = (msg.peers as string[]) || [];
-        for (const peerId of peers) {
-          await this.maybeInitiateOffer(peerId);
+    if (!msg || typeof msg.type !== 'string') return;
+
+    try {
+      switch (msg.type) {
+        case 'self-id': {
+          // If server confirmed or assigned our canonical peer ID, synchronize if no peers exist yet
+          if (typeof msg.id === 'string' && msg.id && this.peers.size === 0) {
+            this.localPeerId = msg.id;
+          }
+          break;
         }
-        break;
-      }
 
-      case 'peer-joined': {
-        const peerId = msg.id as string;
-        if (peerId) {
-          await this.maybeInitiateOffer(peerId);
+        case 'room-peers': {
+          const peers = Array.isArray(msg.peers) ? (msg.peers as string[]) : [];
+          for (const peerId of peers) {
+            await this.maybeInitiateOffer(peerId);
+          }
+          break;
         }
-        break;
-      }
 
-      case 'peer-left': {
-        const peerId = msg.id as string;
-        if (peerId) {
-          this.disconnectPeer(peerId);
+        case 'peer-joined': {
+          const peerId = msg.id as string;
+          if (peerId) {
+            await this.maybeInitiateOffer(peerId);
+          }
+          break;
         }
-        break;
-      }
 
-      case 'offer': {
-        await this.handleOffer(msg);
-        break;
-      }
+        case 'peer-left': {
+          const peerId = msg.id as string;
+          if (peerId) {
+            this.disconnectPeer(peerId);
+          }
+          break;
+        }
 
-      case 'answer': {
-        await this.handleAnswer(msg);
-        break;
-      }
+        case 'offer': {
+          await this.handleOffer(msg);
+          break;
+        }
 
-      case 'ice-candidate': {
-        await this.handleIceCandidate(msg);
-        break;
+        case 'answer': {
+          await this.handleAnswer(msg);
+          break;
+        }
+
+        case 'ice-candidate': {
+          await this.handleIceCandidate(msg);
+          break;
+        }
       }
+    } catch (err) {
+      console.warn(`[ShadowCast MeshManager] Error handling signaling message "${msg.type}":`, err);
     }
   }
 
@@ -91,11 +106,15 @@ export class MeshManager {
         this.callbacks.onDataMessage(data, peerId);
       },
       onDataChannelOpen: () => {
-        this.notifyPeerWaiters();
-        this.callbacks.onPeerJoin?.(peerId, this.openPeersCount);
+        const wasOpen = this.activeOpenPeers.has(peerId);
+        this.activeOpenPeers.add(peerId);
+        this.notifyPeerWaiters(true);
+        if (!wasOpen) {
+          this.callbacks.onPeerJoin?.(peerId, this.openPeersCount);
+        }
       },
       onDataChannelClose: () => {
-        // Will be cleaned up if disconnect triggers
+        this.disconnectPeer(peerId);
       },
       onDisconnect: () => {
         this.disconnectPeer(peerId);
@@ -116,7 +135,7 @@ export class MeshManager {
 
   async handleOffer(msg: SignalingMessagePayload): Promise<void> {
     const fromId = msg.from as string;
-    if (!fromId || fromId === this.localPeerId) return;
+    if (!fromId || fromId === this.localPeerId || !msg.sdp) return;
 
     const existing = this.peers.get(fromId);
     if (existing?.pc.remoteDescription && existing.pc.signalingState === 'stable') {
@@ -134,6 +153,7 @@ export class MeshManager {
 
   async handleAnswer(msg: SignalingMessagePayload): Promise<void> {
     const fromId = msg.from as string;
+    if (!fromId || !msg.sdp) return;
     const peer = this.peers.get(fromId);
     if (!peer || peer.pc.signalingState === 'stable') return;
     await peer.handleAnswer(msg.sdp as RTCSessionDescriptionInit);
@@ -141,16 +161,20 @@ export class MeshManager {
 
   async handleIceCandidate(msg: SignalingMessagePayload): Promise<void> {
     const fromId = msg.from as string;
+    if (!fromId || !msg.candidate) return;
     const peer = this.peers.get(fromId);
-    if (!peer || !msg.candidate) return;
+    if (!peer) return;
     await peer.addIceCandidate(msg.candidate as RTCIceCandidateInit);
   }
 
   disconnectPeer(peerId: string): void {
     const peer = this.peers.get(peerId);
+    const wasActive = this.activeOpenPeers.delete(peerId);
     if (peer) {
-      peer.close();
       this.peers.delete(peerId);
+      peer.close();
+    }
+    if (wasActive || peer) {
       this.callbacks.onPeerLeave?.(peerId, this.openPeersCount);
     }
   }
@@ -200,23 +224,26 @@ export class MeshManager {
       return Promise.resolve(true);
     }
 
+    if (timeoutMs <= 0) {
+      return Promise.resolve(false);
+    }
+
     return new Promise((resolve) => {
       const done = (ready: boolean) => {
         clearTimeout(timer);
-        this.peerWaiters.delete(onPeerReady);
+        this.peerWaiters.delete(done);
         resolve(ready);
       };
 
-      const onPeerReady = () => done(true);
       const timer = setTimeout(() => done(false), timeoutMs);
-      this.peerWaiters.add(onPeerReady);
+      this.peerWaiters.add(done);
     });
   }
 
-  private notifyPeerWaiters(): void {
-    if (!this.hasOpenDataChannel()) return;
-    for (const waiter of this.peerWaiters) {
-      waiter();
+  private notifyPeerWaiters(ready: boolean): void {
+    if (ready && !this.hasOpenDataChannel()) return;
+    for (const waiter of Array.from(this.peerWaiters)) {
+      waiter(ready);
     }
     this.peerWaiters.clear();
   }
@@ -226,6 +253,7 @@ export class MeshManager {
       peer.close();
     }
     this.peers.clear();
-    this.peerWaiters.clear();
+    this.activeOpenPeers.clear();
+    this.notifyPeerWaiters(false);
   }
 }

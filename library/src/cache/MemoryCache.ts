@@ -13,12 +13,22 @@ export class MemoryCache implements CacheStore {
     this.lruPolicy = new LRUPolicy(config.maxSizeBytes, config.maxEntries, config.ttlMs);
   }
 
+  private pruneExpired(): void {
+    if (this.lruPolicy.ttlMs <= 0) return;
+    const now = Date.now();
+    for (const [url, entry] of this.entries.entries()) {
+      if (this.lruPolicy.isExpired(entry, now)) {
+        this.entries.delete(url);
+      }
+    }
+  }
+
   async get(url: string): Promise<Blob | undefined> {
     const entry = this.entries.get(url);
     if (!entry) return undefined;
 
     // Check TTL expiry
-    if (this.lruPolicy.ttlMs > 0 && Date.now() - entry.storedAt > this.lruPolicy.ttlMs) {
+    if (this.lruPolicy.isExpired(entry)) {
       this.entries.delete(url);
       return undefined;
     }
@@ -30,9 +40,14 @@ export class MemoryCache implements CacheStore {
   }
 
   async set(url: string, blob: Blob, meta?: { assetHash?: string }): Promise<void> {
+    if (this.lruPolicy.maxEntries <= 0 || blob.size > this.lruPolicy.maxSizeBytes) {
+      this.pruneExpired();
+      return;
+    }
+
     // Run LRU eviction
     const metadataList = Array.from(this.entries.values());
-    const toEvict = this.lruPolicy.findEvictionCandidates(metadataList, blob.size);
+    const toEvict = this.lruPolicy.findEvictionCandidates(metadataList, blob.size, url);
     for (const evictUrl of toEvict) {
       this.entries.delete(evictUrl);
     }
@@ -42,7 +57,7 @@ export class MemoryCache implements CacheStore {
       url,
       blob,
       size: blob.size,
-      mimeType: blob.type,
+      mimeType: blob.type || 'application/octet-stream',
       assetHash: meta?.assetHash,
       storedAt: now,
       lastAccessedAt: now,
@@ -53,8 +68,13 @@ export class MemoryCache implements CacheStore {
   }
 
   async has(url: string): Promise<boolean> {
-    const blob = await this.get(url);
-    return blob !== undefined;
+    const entry = this.entries.get(url);
+    if (!entry) return false;
+    if (this.lruPolicy.isExpired(entry)) {
+      this.entries.delete(url);
+      return false;
+    }
+    return true;
   }
 
   async delete(url: string): Promise<boolean> {
@@ -66,6 +86,7 @@ export class MemoryCache implements CacheStore {
   }
 
   async getSize(): Promise<number> {
+    this.pruneExpired();
     let size = 0;
     for (const entry of this.entries.values()) {
       size += entry.size;
@@ -74,6 +95,7 @@ export class MemoryCache implements CacheStore {
   }
 
   async getEntriesCount(): Promise<number> {
+    this.pruneExpired();
     return this.entries.size;
   }
 }

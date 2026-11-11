@@ -2,7 +2,7 @@
 
 import React, { useState, useEffect, useRef } from 'react';
 import Link from 'next/link';
-import { ShadowCast, TransferSource, ConnectionState } from 'shadowcast';
+import { ShadowCast, TransferSource, ConnectionState, generateUUID } from 'shadowcast';
 import PeerGraph from './components/PeerGraph';
 
 interface TransferLogEntry {
@@ -77,10 +77,7 @@ export default function ShadowCastDemo() {
     });
     scRef.current = sc;
 
-    // Connect to room
-    sc.connect('shadowcast-global');
-
-    // Subscribe to real telemetry events
+    // Subscribe to real telemetry events before connecting
     const unsubStatus = sc.on('connection:status', ({ state }) => {
       setConnectionStatus(state);
     });
@@ -106,7 +103,7 @@ export default function ShadowCastDemo() {
 
       setLogs((prev) => [
         {
-          id: crypto.randomUUID(),
+          id: generateUUID(),
           url: url.slice(0, 45) + '...',
           source,
           bytes,
@@ -127,11 +124,21 @@ export default function ShadowCastDemo() {
     };
     const unsubHit = sc.on('cache:hit', unsubCacheHit);
 
+    // Connect to room gracefully (falls back to HTTP/Cache if signaling is unreachable)
+    sc.connect('shadowcast-global').catch(() => {
+      setConnectionStatus('disconnected');
+    });
+
     // Check if SW is already registered
     if (typeof window !== 'undefined' && 'serviceWorker' in navigator) {
-      navigator.serviceWorker.getRegistration().then((reg) => {
-        setIsSwRegistered(!!reg);
-      });
+      navigator.serviceWorker
+        .getRegistration()
+        .then((reg) => {
+          setIsSwRegistered(!!reg);
+        })
+        .catch(() => {
+          setIsSwRegistered(false);
+        });
     }
 
     return () => {
@@ -418,7 +425,7 @@ export default function ShadowCastDemo() {
                     <th>Time</th>
                     <th>Source</th>
                     <th>Size</th>
-                    <th>Time</th>
+                    <th>Duration</th>
                   </tr>
                 </thead>
                 <tbody>

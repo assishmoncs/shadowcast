@@ -5,6 +5,7 @@
 import { CacheConfig, CacheStore } from './types.js';
 import { MemoryCache } from './MemoryCache.js';
 import { IndexedDBCache } from './IndexedDBCache.js';
+import { normalizeAssetUrl } from '../utils/url.js';
 
 export class CacheManager {
   private store: CacheStore;
@@ -21,42 +22,76 @@ export class CacheManager {
     }
   }
 
+  private normalize(url: string): string {
+    return normalizeAssetUrl(url) || url;
+  }
+
+  private revokeUrl(key: string): void {
+    const existing = this.objectUrls.get(key);
+    if (existing) {
+      if (typeof URL !== 'undefined' && typeof URL.revokeObjectURL === 'function') {
+        try {
+          URL.revokeObjectURL(existing);
+        } catch {
+          // Ignore revoke errors
+        }
+      }
+      this.objectUrls.delete(key);
+    }
+  }
+
   async get(url: string): Promise<Blob | undefined> {
-    return this.store.get(url);
+    const key = this.normalize(url);
+    const blob = await this.store.get(key);
+    if (!blob) {
+      this.revokeUrl(key);
+    }
+    return blob;
   }
 
   async set(url: string, blob: Blob, meta?: { assetHash?: string }): Promise<void> {
-    await this.store.set(url, blob, meta);
+    const key = this.normalize(url);
+    this.revokeUrl(key);
+    await this.store.set(key, blob, meta);
   }
 
   async has(url: string): Promise<boolean> {
-    return this.store.has(url);
+    const key = this.normalize(url);
+    const exists = await this.store.has(key);
+    if (!exists) {
+      this.revokeUrl(key);
+    }
+    return exists;
   }
 
   async getObjectUrl(url: string): Promise<string | null> {
-    const existing = this.objectUrls.get(url);
+    const key = this.normalize(url);
+    const blob = await this.store.get(key);
+    if (!blob) {
+      this.revokeUrl(key);
+      return null;
+    }
+
+    const existing = this.objectUrls.get(key);
     if (existing) return existing;
 
-    const blob = await this.store.get(url);
-    if (!blob) return null;
-
-    const objUrl = URL.createObjectURL(blob);
-    this.objectUrls.set(url, objUrl);
+    const objUrl =
+      typeof URL !== 'undefined' && typeof URL.createObjectURL === 'function'
+        ? URL.createObjectURL(blob)
+        : `blob:shadowcast/${ encodeURIComponent(key) }`;
+    this.objectUrls.set(key, objUrl);
     return objUrl;
   }
 
   async delete(url: string): Promise<boolean> {
-    const objUrl = this.objectUrls.get(url);
-    if (objUrl) {
-      URL.revokeObjectURL(objUrl);
-      this.objectUrls.delete(url);
-    }
-    return this.store.delete(url);
+    const key = this.normalize(url);
+    this.revokeUrl(key);
+    return this.store.delete(key);
   }
 
   async clear(): Promise<void> {
-    for (const objUrl of this.objectUrls.values()) {
-      URL.revokeObjectURL(objUrl);
+    for (const key of Array.from(this.objectUrls.keys())) {
+      this.revokeUrl(key);
     }
     this.objectUrls.clear();
     await this.store.clear();

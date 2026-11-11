@@ -6,8 +6,40 @@
 const sw = self;
 
 const DEFAULT_PATTERNS = [
-  /\.(png|jpe?g|gif|webp|svg|avif|ico|mp4|webm|mp3|wasm|woff2?)$/i,
+  /\.(png|jpe?g|gif|webp|svg|avif|ico|mp4|webm|mp3|wasm|woff2?)(\?.*)?$/i,
 ];
+
+let includePatterns = [...DEFAULT_PATTERNS];
+let excludePatterns = [];
+let requestTimeoutMs = 8000;
+
+function generateRequestId() {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    try {
+      return crypto.randomUUID();
+    } catch {
+      // Fallback
+    }
+  }
+  return 'sc-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10);
+}
+
+function shouldInterceptUrl(rawUrl) {
+  let pathname = rawUrl;
+  try {
+    pathname = new URL(rawUrl).pathname;
+  } catch {
+    // Keep rawUrl
+  }
+
+  for (const exclude of excludePatterns) {
+    if (exclude.test(rawUrl) || exclude.test(pathname)) {
+      return false;
+    }
+  }
+
+  return includePatterns.some((pattern) => pattern.test(rawUrl) || pattern.test(pathname));
+}
 
 sw.addEventListener('install', (event) => {
   event.waitUntil(sw.skipWaiting());
@@ -15,6 +47,21 @@ sw.addEventListener('install', (event) => {
 
 sw.addEventListener('activate', (event) => {
   event.waitUntil(sw.clients.claim());
+});
+
+sw.addEventListener('message', (event) => {
+  const data = event.data;
+  if (!data || data.type !== 'SHADOWCAST_SW_CONFIG') return;
+
+  if (Array.isArray(data.includePatterns) && data.includePatterns.length > 0) {
+    includePatterns = data.includePatterns.map((p) => new RegExp(p, 'i'));
+  }
+  if (Array.isArray(data.excludePatterns)) {
+    excludePatterns = data.excludePatterns.map((p) => new RegExp(p, 'i'));
+  }
+  if (typeof data.timeoutMs === 'number' && data.timeoutMs > 0) {
+    requestTimeoutMs = data.timeoutMs;
+  }
 });
 
 sw.addEventListener('fetch', (event) => {
@@ -27,8 +74,7 @@ sw.addEventListener('fetch', (event) => {
   }
 
   // Check if URL matches static asset extensions or configured patterns
-  const isStaticAsset = DEFAULT_PATTERNS.some((pattern) => pattern.test(url));
-  if (!isStaticAsset) {
+  if (!shouldInterceptUrl(url)) {
     return;
   }
 
@@ -42,18 +88,28 @@ sw.addEventListener('fetch', (event) => {
         }
 
         const client = allClients[0];
-        const requestId = crypto.randomUUID();
+        const requestId = generateRequestId();
 
         // Create a MessageChannel to receive the response
         const channel = new MessageChannel();
 
         const responsePromise = new Promise((resolve, reject) => {
           const timeout = setTimeout(() => {
+            try {
+              channel.port1.close();
+            } catch {
+              // Ignore
+            }
             reject(new Error('ShadowCast SW request timed out'));
-          }, 8000);
+          }, requestTimeoutMs);
 
           channel.port1.onmessage = (msgEvent) => {
             clearTimeout(timeout);
+            try {
+              channel.port1.close();
+            } catch {
+              // Ignore
+            }
             const data = msgEvent.data;
 
             if (data && data.success && data.blob) {

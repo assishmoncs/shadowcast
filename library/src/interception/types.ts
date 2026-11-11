@@ -24,6 +24,13 @@ export interface SWAssetResponseMessage {
   error?: string;
 }
 
+export interface SWConfigMessage {
+  type: 'SHADOWCAST_SW_CONFIG';
+  includePatterns?: string[];
+  excludePatterns?: string[];
+  timeoutMs?: number;
+}
+
 export const DEFAULT_SW_INCLUDE_PATTERNS: RegExp[] = [
-  /\.(png|jpe?g|gif|webp|svg|avif|ico|mp4|webm|mp3|wasm|woff2?)$/i,
+  /\.(png|jpe?g|gif|webp|svg|avif|ico|mp4|webm|mp3|wasm|woff2?)(\?.*)?$/i,
 ];

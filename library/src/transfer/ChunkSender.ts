@@ -6,20 +6,25 @@ import { Chunk, DEFAULT_CHUNK_SIZE } from '../core/types.js';
 import { hashBuffer, hashBlob } from '../utils/hash.js';
 
 export class ChunkSender {
-  constructor(private chunkSize: number = DEFAULT_CHUNK_SIZE) {}
+  private readonly chunkSize: number;
+
+  constructor(chunkSize: number = DEFAULT_CHUNK_SIZE) {
+    this.chunkSize = chunkSize > 0 ? Math.floor(chunkSize) : DEFAULT_CHUNK_SIZE;
+  }
 
   async sendBlob(
     sendFn: (data: string | ArrayBuffer) => boolean,
     assetId: string,
     blob: Blob,
     specificIndices?: number[]
-  ): Promise<void> {
-    const totalChunks = Math.ceil(blob.size / this.chunkSize);
+  ): Promise<boolean> {
+    const totalChunks = blob.size > 0 ? Math.ceil(blob.size / this.chunkSize) : 0;
     const assetHash = await hashBlob(blob);
+    const mimeType = blob.type || 'application/octet-stream';
 
     const indicesToSend =
-      specificIndices && specificIndices.length > 0
-        ? specificIndices.filter((idx) => idx >= 0 && idx < totalChunks)
+      specificIndices !== undefined
+        ? Array.from(new Set(specificIndices)).filter((idx) => idx >= 0 && idx < totalChunks)
         : Array.from({ length: totalChunks }, (_, i) => i);
 
     for (const i of indicesToSend) {
@@ -31,23 +36,25 @@ export class ChunkSender {
         index: i,
         total: totalChunks,
         assetId,
+        mimeType,
         chunkHash,
         assetHash,
       };
 
       const metaSent = sendFn(JSON.stringify({ ...meta, type: 'chunk-meta' }));
-      if (!metaSent) return;
+      if (!metaSent) return false;
 
       const dataSent = sendFn(buffer);
-      if (!dataSent) return;
+      if (!dataSent) return false;
     }
 
-    sendFn(
+    return sendFn(
       JSON.stringify({
         type: 'chunk-done',
         assetId,
+        total: totalChunks,
         assetHash,
-        mimeType: blob.type,
+        mimeType,
       })
     );
   }
@@ -57,11 +64,11 @@ export class ChunkSender {
     assetId: string,
     url: string,
     blob: Blob
-  ): Promise<void> {
-    const totalChunks = Math.ceil(blob.size / this.chunkSize);
+  ): Promise<boolean> {
+    const totalChunks = blob.size > 0 ? Math.ceil(blob.size / this.chunkSize) : 0;
     const assetHash = await hashBlob(blob);
 
-    sendFn(
+    return sendFn(
       JSON.stringify({
         type: 'swarm-bitfield',
         assetId,
@@ -69,7 +76,7 @@ export class ChunkSender {
         totalChunks,
         availableChunks: Array.from({ length: totalChunks }, (_, i) => i),
         assetHash,
-        mimeType: blob.type,
+        mimeType: blob.type || 'application/octet-stream',
       })
     );
   }

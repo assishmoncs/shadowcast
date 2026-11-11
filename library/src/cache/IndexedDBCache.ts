@@ -26,7 +26,7 @@ export class IndexedDBCache implements CacheStore {
       throw new Error('IndexedDB is not supported in this environment');
     }
 
-    this.dbPromise = new Promise((resolve, reject) => {
+    this.dbPromise = new Promise<IDBDatabase>((resolve, reject) => {
       const request = indexedDB.open(DB_NAME, DB_VERSION);
 
       request.onupgradeneeded = () => {
@@ -38,8 +38,27 @@ export class IndexedDBCache implements CacheStore {
         }
       };
 
-      request.onsuccess = () => resolve(request.result);
-      request.onerror = () => reject(request.error);
+      request.onsuccess = () => {
+        const db = request.result;
+        db.onversionchange = () => {
+          db.close();
+          this.dbPromise = null;
+        };
+        db.onclose = () => {
+          this.dbPromise = null;
+        };
+        resolve(db);
+      };
+
+      request.onerror = () => {
+        this.dbPromise = null;
+        reject(request.error);
+      };
+
+      request.onblocked = () => {
+        this.dbPromise = null;
+        reject(new Error('IndexedDB open request was blocked'));
+      };
     });
 
     return this.dbPromise;
@@ -60,15 +79,23 @@ export class IndexedDBCache implements CacheStore {
       if (!entry) return undefined;
 
       // TTL check
-      if (this.lruPolicy.ttlMs > 0 && Date.now() - entry.storedAt > this.lruPolicy.ttlMs) {
-        store.delete(url);
+      if (this.lruPolicy.isExpired(entry)) {
+        await new Promise<void>((resolve) => {
+          const delReq = store.delete(url);
+          delReq.onsuccess = () => resolve();
+          delReq.onerror = () => resolve();
+        });
         return undefined;
       }
 
       // Update access stats
       entry.lastAccessedAt = Date.now();
       entry.accessCount = (entry.accessCount || 0) + 1;
-      store.put(entry);
+      await new Promise<void>((resolve) => {
+        const putReq = store.put(entry);
+        putReq.onsuccess = () => resolve();
+        putReq.onerror = () => resolve();
+      });
 
       return entry.blob;
     } catch (err) {
@@ -79,9 +106,13 @@ export class IndexedDBCache implements CacheStore {
 
   async set(url: string, blob: Blob, meta?: { assetHash?: string }): Promise<void> {
     try {
+      if (this.lruPolicy.maxEntries <= 0 || blob.size > this.lruPolicy.maxSizeBytes) {
+        return;
+      }
+
       // Execute eviction check
       const metadataList = await this.getAllMetadata();
-      const toEvict = this.lruPolicy.findEvictionCandidates(metadataList, blob.size);
+      const toEvict = this.lruPolicy.findEvictionCandidates(metadataList, blob.size, url);
       for (const evictUrl of toEvict) {
         await this.delete(evictUrl);
       }
@@ -95,7 +126,7 @@ export class IndexedDBCache implements CacheStore {
         url,
         blob,
         size: blob.size,
-        mimeType: blob.type,
+        mimeType: blob.type || 'application/octet-stream',
         assetHash: meta?.assetHash,
         storedAt: now,
         lastAccessedAt: now,
@@ -142,8 +173,28 @@ export class IndexedDBCache implements CacheStore {
   }
 
   async has(url: string): Promise<boolean> {
-    const blob = await this.get(url);
-    return blob !== undefined;
+    try {
+      const db = await this.getDB();
+      const tx = db.transaction(STORE_NAME, 'readwrite');
+      const store = tx.objectStore(STORE_NAME);
+
+      const entry = await new Promise<CacheEntry | undefined>((resolve, reject) => {
+        const req = store.get(url);
+        req.onsuccess = () => resolve(req.result as CacheEntry | undefined);
+        req.onerror = () => reject(req.error);
+      });
+
+      if (!entry) return false;
+
+      if (this.lruPolicy.isExpired(entry)) {
+        store.delete(url);
+        return false;
+      }
+
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   async delete(url: string): Promise<boolean> {
@@ -181,11 +232,15 @@ export class IndexedDBCache implements CacheStore {
 
   async getSize(): Promise<number> {
     const metadata = await this.getAllMetadata();
-    return metadata.reduce((acc, m) => acc + m.size, 0);
+    const now = Date.now();
+    return metadata
+      .filter((m) => !this.lruPolicy.isExpired(m, now))
+      .reduce((acc, m) => acc + m.size, 0);
   }
 
   async getEntriesCount(): Promise<number> {
     const metadata = await this.getAllMetadata();
-    return metadata.length;
+    const now = Date.now();
+    return metadata.filter((m) => !this.lruPolicy.isExpired(m, now)).length;
   }
 }

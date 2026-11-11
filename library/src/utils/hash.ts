@@ -1,34 +1,139 @@
 /**
- * ShadowCast - Cryptographic Hash Utilities (Web Crypto API)
+ * ShadowCast - Cryptographic Hash Utilities (Web Crypto API + Pure JS SHA-256 Fallback)
  */
 
-/**
- * Computes SHA-256 hash of an ArrayBuffer as a lowercase hex string.
- */
-export async function hashBuffer(buffer: ArrayBuffer): Promise<string> {
-  if (typeof crypto !== 'undefined' && crypto.subtle) {
-    const digest = await crypto.subtle.digest('SHA-256', buffer);
-    return Array.from(new Uint8Array(digest))
-      .map((b) => b.toString(16).padStart(2, '0'))
-      .join('');
-  }
+const SHA256_K = new Uint32Array([
+  0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+  0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+  0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+  0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+  0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+  0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+  0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+  0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+]);
 
-  // Fallback FNV-1a / Murmur-like hash if subtle crypto is unavailable
-  let h1 = 0xdeadbeef ^ buffer.byteLength;
-  let h2 = 0x41c6ce57 ^ buffer.byteLength;
-  const view = new Uint8Array(buffer);
-  for (let i = 0; i < view.length; i++) {
-    const ch = view[i];
-    h1 = Math.imul(h1 ^ ch, 2654435761);
-    h2 = Math.imul(h2 ^ ch, 1597334677);
-  }
-  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
-  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
-  return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(16);
+function rotr(n: number, x: number): number {
+  return (x >>> n) | (x << (32 - n));
 }
 
 /**
- * Computes SHA-256 hash of a Blob as a lowercase hex string.
+ * Pure TypeScript FIPS 180-4 SHA-256 implementation for environments without Web Crypto Subtle.
+ */
+export function sha256Fallback(bytes: Uint8Array): string {
+  let h0 = 0x6a09e667;
+  let h1 = 0xbb67ae85;
+  let h2 = 0x3c6ef372;
+  let h3 = 0xa54ff53a;
+  let h4 = 0x510e527f;
+  let h5 = 0x9b05688c;
+  let h6 = 0x1f83d9ab;
+  let h7 = 0x5be0cd19;
+
+  const len = bytes.length;
+  const bitLenHi = Math.floor((len * 8) / 0x100000000);
+  const bitLenLo = (len * 8) >>> 0;
+
+  const paddedLen = ((len + 9 + 63) >> 6) << 6;
+  const padded = new Uint8Array(paddedLen);
+  padded.set(bytes);
+  padded[len] = 0x80;
+
+  const view = new DataView(padded.buffer, padded.byteOffset, padded.byteLength);
+  view.setUint32(paddedLen - 8, bitLenHi, false);
+  view.setUint32(paddedLen - 4, bitLenLo, false);
+
+  const w = new Uint32Array(64);
+
+  for (let offset = 0; offset < paddedLen; offset += 64) {
+    for (let i = 0; i < 16; i++) {
+      w[i] = view.getUint32(offset + i * 4, false);
+    }
+    for (let i = 16; i < 64; i++) {
+      const s0 = rotr(7, w[i - 15]) ^ rotr(18, w[i - 15]) ^ (w[i - 15] >>> 3);
+      const s1 = rotr(17, w[i - 2]) ^ rotr(19, w[i - 2]) ^ (w[i - 2] >>> 10);
+      w[i] = (w[i - 16] + s0 + w[i - 7] + s1) >>> 0;
+    }
+
+    let a = h0;
+    let b = h1;
+    let c = h2;
+    let d = h3;
+    let e = h4;
+    let f = h5;
+    let g = h6;
+    let h = h7;
+
+    for (let i = 0; i < 64; i++) {
+      const S1 = rotr(6, e) ^ rotr(11, e) ^ rotr(25, e);
+      const ch = (e & f) ^ (~e & g);
+      const temp1 = (h + S1 + ch + SHA256_K[i] + w[i]) >>> 0;
+      const S0 = rotr(2, a) ^ rotr(13, a) ^ rotr(22, a);
+      const maj = (a & b) ^ (a & c) ^ (b & c);
+      const temp2 = (S0 + maj) >>> 0;
+
+      h = g;
+      g = f;
+      f = e;
+      e = (d + temp1) >>> 0;
+      d = c;
+      c = b;
+      b = a;
+      a = (temp1 + temp2) >>> 0;
+    }
+
+    h0 = (h0 + a) >>> 0;
+    h1 = (h1 + b) >>> 0;
+    h2 = (h2 + c) >>> 0;
+    h3 = (h3 + d) >>> 0;
+    h4 = (h4 + e) >>> 0;
+    h5 = (h5 + f) >>> 0;
+    h6 = (h6 + g) >>> 0;
+    h7 = (h7 + h) >>> 0;
+  }
+
+  return [h0, h1, h2, h3, h4, h5, h6, h7]
+    .map((word) => (word >>> 0).toString(16).padStart(8, '0'))
+    .join('');
+}
+
+function toUint8Array(input: ArrayBuffer | ArrayBufferView): Uint8Array {
+  if (input instanceof Uint8Array) {
+    return input;
+  }
+  if (ArrayBuffer.isView(input)) {
+    return new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
+  }
+  return new Uint8Array(input);
+}
+
+/**
+ * Computes SHA-256 hash of an ArrayBuffer or ArrayBufferView as a 64-character lowercase hex string.
+ */
+export async function hashBuffer(buffer: ArrayBuffer | ArrayBufferView): Promise<string> {
+  const bytes = toUint8Array(buffer);
+  const subtle = typeof globalThis !== 'undefined' ? globalThis.crypto?.subtle : undefined;
+
+  if (subtle) {
+    try {
+      const cleanBuffer =
+        bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength
+          ? (bytes.buffer as ArrayBuffer)
+          : (bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer);
+      const digest = await subtle.digest('SHA-256', cleanBuffer);
+      return Array.from(new Uint8Array(digest))
+        .map((b) => b.toString(16).padStart(2, '0'))
+        .join('');
+    } catch {
+      // Fallback to pure JS SHA-256 if subtle.digest fails
+    }
+  }
+
+  return sha256Fallback(bytes);
+}
+
+/**
+ * Computes SHA-256 hash of a Blob as a 64-character lowercase hex string.
  */
 export async function hashBlob(blob: Blob): Promise<string> {
   const buffer = await blob.arrayBuffer();
@@ -36,10 +141,10 @@ export async function hashBlob(blob: Blob): Promise<string> {
 }
 
 /**
- * Computes SHA-256 hash of a string.
+ * Computes SHA-256 hash of a UTF-8 string as a 64-character lowercase hex string.
  */
 export async function hashString(str: string): Promise<string> {
   const encoder = new TextEncoder();
   const data = encoder.encode(str);
-  return hashBuffer(data.buffer as ArrayBuffer);
+  return hashBuffer(data);
 }
