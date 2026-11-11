@@ -58,12 +58,17 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
-      - run: docker compose up --build --detach
-      - run: |
-          curl --retry 15 --retry-connrefused --retry-delay 1 --fail http://127.0.0.1:8080/ready
-          curl --retry 15 --retry-connrefused --retry-delay 1 --fail --output /dev/null http://127.0.0.1:3000/
-          curl --fail --output /dev/null http://127.0.0.1:3000/shadowcast-sw.js
-      - if: failure()
-        run: docker compose logs
+      - name: Build and wait for Compose services
+        run: docker compose up --build --wait --wait-timeout 60
+      - name: Verify published HTTP endpoints
+        run: |
+          curl --retry 15 --retry-connrefused --retry-delay 1 --fail --silent --show-error --max-time 10 http://127.0.0.1:8080/ready
+          curl --fail --silent --show-error --max-time 10 --output /dev/null http://127.0.0.1:3000/
+          curl --fail --silent --show-error --max-time 10 --output /dev/null http://127.0.0.1:3000/shadowcast-sw.js
+      - name: Show container status and logs
+        if: failure()
+        run: |
+          docker compose ps --all
+          docker compose logs --no-color --timestamps
       - if: always()
         run: docker compose down

@@ -22,4 +22,6 @@ COPY --from=build --chown=node:node /app/demo/.next/static/ ./demo/.next/static/
 COPY --from=build --chown=node:node /app/demo/public/ ./demo/public/
 USER node
 EXPOSE 3000
+HEALTHCHECK --interval=5s --timeout=3s --start-period=10s --retries=6 \
+  CMD wget -O /dev/null "http://127.0.0.1:${PORT}/"
 CMD ["node", "demo/server.js"]
